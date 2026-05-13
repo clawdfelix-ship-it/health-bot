@@ -1,0 +1,7 @@
+{
+  "zeabur": {
+    "lang": "python3",
+    "command": "bash start.sh",
+    "port": 5000
+  }
+}
