@@ -335,17 +335,16 @@ def handle_text(text, chat_id):
             sugar_types = ["sugar_0", "sugar_1", "sugar_2"]
             entry_type = sugar_types[p["sugar_idx"]]
             record_entry(chat_id, entry_type, value)
-            now = now().strftime("%H:%M")
             labels = ["空腹血糖", "午後血糖", "晚後血糖"]
             send_message(chat_id,
                 f"✅ 血糖已記錄\n\n"
                 f"🩸 {labels[p['sugar_idx']]}：{value}\n"
-                f"時間：{now}")
+                f"時間：{now()}")
             # Now ask for uric acid
             pending[chat_id] = {"type": "uric_acid_pending"}
             send_message(chat_id,
                 "🟤 請回覆尿酸值（如：360）\n\n"
-                f"時間：{now}")
+                f"時間：{now()}")
             return
 
         elif ptype == "uric_acid_pending":
@@ -367,12 +366,11 @@ def handle_text(text, chat_id):
                         float(sys_val); float(dia_val)
                         record_entry(chat_id, "bp_sys", sys_val)
                         record_entry(chat_id, "bp_dia", dia_val)
-                        now = now().strftime("%H:%M")
                         send_message(chat_id,
                             f"✅ 血壓已記錄\n\n"
                             f"❤️ 收縮壓：{sys_val} mmHg\n"
                             f"💓 舒張壓：{dia_val} mmHg\n"
-                            f"時間：{now}")
+                            f"時間：{now()}")
                         return
                     except ValueError:
                         pass
