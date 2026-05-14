@@ -288,32 +288,33 @@ def handle_callback(callback, chat_id, message_id):
         export_and_send(chat_id, message_id)
         return
 
-    # Sugar / BP / Uric Acid entry — initiate pending
-    if data in ("sugar_0", "sugar_1", "sugar_2", "bp_sys", "bp_dia", "uric_acid"):
-        pending[chat_id] = {"type": data, "time": datetime.now().strftime("%H:%M")}
-        labels = {
-            "sugar_0": "🩸 空腹血糖",
-            "sugar_1": "🩸 午後血糖",
-            "sugar_2": "🩸 晚後血糖",
-            "bp_sys": "❤️ 收縮壓",
-            "bp_dia": "💓 舒張壓",
-            "uric_acid": "🟤 尿酸",
-        }
-        prompt = {
-            "sugar_0": "🩸 請回覆空腹血糖值（如：5.2）",
-            "sugar_1": "🩸 請回覆午後血糖值（如：7.8）",
-            "sugar_2": "🩸 請回覆晚後血糖值（如：8.1）",
-            "bp_sys": "❤️ 請回覆收縮壓（如：125）",
-            "bp_dia": "💓 請回覆舒張壓（如：80）",
-            "uric_acid": "🟤 請回覆尿酸值（如：360）",
-        }
-        edit_message(chat_id, message_id, prompt[data], back_btn())
+    # Sugar entry — initiate pending, ask for uric acid after sugar
+    if data in ("sugar_0", "sugar_1", "sugar_2"):
+        pending[chat_id] = {"type": "sugar", "sugar_idx": int(data.split("_")[1])}
+        edit_message(chat_id, message_id,
+            "🩸 請回覆血糖值（如：5.2）\n\n時間：" + datetime.now().strftime("%H:%M"),
+            back_btn())
+        return
+
+    # BP entry — ask for both readings together
+    if data in ("bp_sys", "bp_dia"):
+        pending[chat_id] = {"type": "bp", "bp_type": data}
+        edit_message(chat_id, message_id,
+            "❤️ 請回覆血壓（如：125/80）\n\n時間：" + datetime.now().strftime("%H:%M"),
+            back_btn())
+        return
+
+    if data == "uric_acid":
+        pending[chat_id] = {"type": "uric_acid"}
+        edit_message(chat_id, message_id,
+            "🟤 請回覆尿酸值（如：360）\n\n時間：" + datetime.now().strftime("%H:%M"),
+            back_btn())
         return
 
 def handle_text(text, chat_id):
     if chat_id in pending:
         p = pending.pop(chat_id)
-        entry_type = p["type"]
+        ptype = p["type"]
         value = text.strip()
 
         # Validate
@@ -323,23 +324,62 @@ def handle_text(text, chat_id):
             send_message(chat_id, "❌ 數值格式錯誤，請重新輸入（如：5.2）")
             return
 
-        record = record_entry(chat_id, entry_type, value)
+        if ptype == "sugar":
+            # Record sugar
+            sugar_types = ["sugar_0", "sugar_1", "sugar_2"]
+            entry_type = sugar_types[p["sugar_idx"]]
+            record_entry(chat_id, entry_type, value)
+            now = datetime.now().strftime("%H:%M")
+            labels = ["空腹血糖", "午後血糖", "晚後血糖"]
+            send_message(chat_id,
+                f"✅ 血糖已記錄\n\n"
+                f"🩸 {labels[p['sugar_idx']]}：{value}\n"
+                f"時間：{now}")
+            # Now ask for uric acid
+            pending[chat_id] = {"type": "uric_acid_pending"}
+            send_message(chat_id,
+                "🟤 請回覆尿酸值（如：360）\n\n"
+                f"時間：{now}")
+            return
 
-        labels = {
-            "sugar_0": "空腹血糖",
-            "sugar_1": "午後血糖",
-            "sugar_2": "晚後血糖",
-            "bp_sys": "收縮壓",
-            "bp_dia": "舒張壓",
-            "uric_acid": "尿酸",
-        }
+        elif ptype == "uric_acid_pending":
+            record_entry(chat_id, "uric_acid", value)
+            send_message(chat_id,
+                f"✅ 尿酸已記錄\n\n"
+                f"🟤 尿酸：{value} μmol/L\n"
+                f"時間：{datetime.now().strftime('%H:%M')}")
+            return
 
-        units = {"sugar_0": "", "sugar_1": "", "sugar_2": "", "bp_sys": "mmHg", "bp_dia": "mmHg", "uric_acid": "μmol/L"}
-        send_message(chat_id,
-            f"✅ 已記錄\n\n"
-            f"{labels[entry_type]}：{value} {units[entry_type]}\n"
-            f"時間：{record['time']}")
-        return
+        elif ptype == "bp":
+            # Blood pressure — device gives both readings like "125/80"
+            if "/" in value:
+                parts = value.split("/")
+                if len(parts) == 2:
+                    sys_val = parts[0].strip()
+                    dia_val = parts[1].strip()
+                    try:
+                        float(sys_val); float(dia_val)
+                        record_entry(chat_id, "bp_sys", sys_val)
+                        record_entry(chat_id, "bp_dia", dia_val)
+                        now = datetime.now().strftime("%H:%M")
+                        send_message(chat_id,
+                            f"✅ 血壓已記錄\n\n"
+                            f"❤️ 收縮壓：{sys_val} mmHg\n"
+                            f"💓 舒張壓：{dia_val} mmHg\n"
+                            f"時間：{now}")
+                        return
+                    except ValueError:
+                        pass
+            send_message(chat_id, "❌ 請輸入格式如：125/80（收縮壓/舒張壓）")
+            return
+
+        elif ptype == "uric_acid":
+            record_entry(chat_id, "uric_acid", value)
+            send_message(chat_id,
+                f"✅ 尿酸已記錄\n\n"
+                f"🟤 尿酸：{value} μmol/L\n"
+                f"時間：{datetime.now().strftime('%H:%M')}")
+            return
 
     # Default: show main menu
     send_message(chat_id, "🏠 主菜單", main_menu())
