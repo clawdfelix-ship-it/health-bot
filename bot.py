@@ -124,7 +124,6 @@ def record_menu():
     return {"inline_keyboard": [
         [{"text": "🩸 空腹血糖", "callback_data": "sugar_0"}, {"text": "🩸 午後血糖", "callback_data": "sugar_1"}, {"text": "🩸 晚後血糖", "callback_data": "sugar_2"}],
         [{"text": "❤️ 收縮壓", "callback_data": "bp_sys"}, {"text": "💓 舒張壓", "callback_data": "bp_dia"}],
-        [{"text": "🟤 尿酸", "callback_data": "uric_acid"}],
         [{"text": "🔙 返回主菜單", "callback_data": "back"}],
     ]}
 
@@ -193,10 +192,11 @@ def get_today_summary():
     records = data[today]["records"]
     lines = ["📖 今日記錄 — " + now.strftime("%Y年%m月%d日"), ""]
 
+    # sugar_0/1/2 + uric_0/1/2 come in pairs
     sugars = [None, None, None]   # 0=空腹, 1=午後, 2=晚後
+    urics  = [None, None, None]
     sys_bp = None
     dia_bp = None
-    uric = None
 
     for r in records:
         t = r["type"]
@@ -204,16 +204,30 @@ def get_today_summary():
         if t == "sugar_0": sugars[0] = v
         elif t == "sugar_1": sugars[1] = v
         elif t == "sugar_2": sugars[2] = v
+        elif t == "uric_0":  urics[0]  = v
+        elif t == "uric_1":  urics[1]  = v
+        elif t == "uric_2":  urics[2]  = v
         elif t == "bp_sys": sys_bp = v
         elif t == "bp_dia": dia_bp = v
-        elif t == "uric_acid": uric = v
 
     labels = ["空腹血糖", "午後血糖", "晚後血糖"]
+
+    def uric_tier(v):
+        u = float(v)
+        if u < 420:   return "🟢"
+        if u < 540:   return "🟡"
+        return "🔴"
+
     for i, v in enumerate(sugars):
-        if v is not None:
-            lines.append(f"🩸 {labels[i]}：{v}")
+        s_label = labels[i]
+        u_val = urics[i]
+        if v is not None and u_val is not None:
+            tier = uric_tier(u_val)
+            lines.append(f"🩸 {s_label}：{v}    {tier}尿酸：{u_val}")
+        elif v is not None:
+            lines.append(f"🩸 {s_label}：{v}")
         else:
-            lines.append(f"🩸 {labels[i]}：—")
+            lines.append(f"🩸 {s_label}：—")
 
     if sys_bp is not None and dia_bp is not None:
         lines.append(f"❤️ 血壓：{sys_bp}/{dia_bp}")
@@ -221,16 +235,6 @@ def get_today_summary():
         lines.append(f"❤️ 收縮壓：{sys_bp}")
     elif dia_bp is not None:
         lines.append(f"💓 舒張壓：{dia_bp}")
-
-    if uric is not None:
-        u = float(uric)
-        if u < 420:
-            uric_label = f"🟢 尿酸：{uric} μmol/L（正常）"
-        elif u < 540:
-            uric_label = f"🟡 尿酸：{uric} μmol/L（偏高）"
-        else:
-            uric_label = f"🔴 尿酸：{uric} μmol/L（好高）"
-        lines.append(uric_label)
 
     lines.append("")
     lines.append("🔙 返回主菜單")
@@ -342,24 +346,26 @@ def handle_text(text, chat_id):
             return
 
         if ptype == "sugar":
-            # Record sugar
-            sugar_types = ["sugar_0", "sugar_1", "sugar_2"]
-            entry_type = sugar_types[p["sugar_idx"]]
+            sugar_types  = ["sugar_0", "sugar_1", "sugar_2"]
+            uric_types   = ["uric_0",  "uric_1",  "uric_2"]
+            entry_type   = sugar_types[p["sugar_idx"]]
             record_entry(chat_id, entry_type, value)
             labels = ["空腹血糖", "午後血糖", "晚後血糖"]
             send_message(chat_id,
                 f"✅ 血糖已記錄\n\n"
                 f"🩸 {labels[p['sugar_idx']]}：{value}\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
-            # Now ask for uric acid
-            pending[chat_id] = {"type": "uric_acid_pending"}
+            # Now ask for paired uric acid
+            pending[chat_id] = {"type": "uric_acid", "uric_idx": p["sugar_idx"]}
             send_message(chat_id,
                 "🟤 請回覆尿酸值（如：360）\n\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
             return
 
-        elif ptype == "uric_acid_pending":
-            record_entry(chat_id, "uric_acid", value)
+        elif ptype == "uric_acid":
+            uric_idx = p.get("uric_idx", 0)
+            uric_types = ["uric_0", "uric_1", "uric_2"]
+            record_entry(chat_id, uric_types[uric_idx], value)
             u = float(value)
             if u < 420:
                 uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
@@ -396,7 +402,9 @@ def handle_text(text, chat_id):
             return
 
         elif ptype == "uric_acid":
-            record_entry(chat_id, "uric_acid", value)
+            uric_idx = p.get("uric_idx", 0)
+            uric_types = ["uric_0", "uric_1", "uric_2"]
+            record_entry(chat_id, uric_types[uric_idx], value)
             u = float(value)
             if u < 420:
                 uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
