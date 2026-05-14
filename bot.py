@@ -23,7 +23,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ── Timezone ────────────────────────────────────────────────────────
 TZ = timezone(timedelta(hours=8))   # Hong Kong Time (HKT/UTC+8)
 
-def now():
+def hk_now():
     return datetime.now(TZ)
 
 # ── Flask ──────────────────────────────────────────────────────────
@@ -135,11 +135,11 @@ pending = {}   # chat_id -> {"type": "sugar"|"bp", "idx": int, "time": str}
 def get_pending_text(pending_type, idx):
     labels = ["空腹血糖", "午後血糖", "晚後血糖"]
     if pending_type == "sugar":
-        return f"🩸 請回覆血糖值（如：5.2）\n\n時間：{now().strftime('%H:%M')}"
+        return f"🩸 請回覆血糖值（如：5.2）\n\n時間：{hk_now().strftime('%H:%M')}"
     elif pending_type == "bp_sys":
-        return f"❤️ 請回覆收縮壓（如：125）\n\n時間：{now().strftime('%H:%M')}"
+        return f"❤️ 請回覆收縮壓（如：125）\n\n時間：{hk_now().strftime('%H:%M')}"
     elif pending_type == "bp_dia":
-        return f"💓 請回覆舒張壓（如：80）\n\n時間：{now().strftime('%H:%M')}"
+        return f"💓 請回覆舒張壓（如：80）\n\n時間：{hk_now().strftime('%H:%M')}"
 
 # ── Data storage ─────────────────────────────────────────────────────
 
@@ -160,7 +160,7 @@ def save_data(data):
 
 def record_entry(chat_id, entry_type, value):
     """Record a health entry for today."""
-    now = now()
+    now = hk_now()
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
 
@@ -179,7 +179,7 @@ def record_entry(chat_id, entry_type, value):
 
 def get_today_summary():
     """Build today's summary string."""
-    now = now()
+    now = hk_now()
     today = now.strftime("%Y-%m-%d")
     data = load_data()
 
@@ -298,7 +298,7 @@ def handle_callback(callback, chat_id, message_id):
     if data in ("sugar_0", "sugar_1", "sugar_2"):
         pending[chat_id] = {"type": "sugar", "sugar_idx": int(data.split("_")[1])}
         edit_message(chat_id, message_id,
-            "🩸 請回覆血糖值（如：5.2）\n\n時間：" + now().strftime("%H:%M"),
+            "🩸 請回覆血糖值（如：5.2）\n\n時間：" + hk_now().strftime("%H:%M"),
             back_btn())
         return
 
@@ -306,14 +306,14 @@ def handle_callback(callback, chat_id, message_id):
     if data in ("bp_sys", "bp_dia"):
         pending[chat_id] = {"type": "bp", "bp_type": data}
         edit_message(chat_id, message_id,
-            "❤️ 請回覆血壓（如：125/80）\n\n時間：" + now().strftime("%H:%M"),
+            "❤️ 請回覆血壓（如：125/80）\n\n時間：" + hk_now().strftime("%H:%M"),
             back_btn())
         return
 
     if data == "uric_acid":
         pending[chat_id] = {"type": "uric_acid"}
         edit_message(chat_id, message_id,
-            "🟤 請回覆尿酸值（如：360）\n\n時間：" + now().strftime("%H:%M"),
+            "🟤 請回覆尿酸值（如：360）\n\n時間：" + hk_now().strftime("%H:%M"),
             back_btn())
         return
 
@@ -339,12 +339,12 @@ def handle_text(text, chat_id):
             send_message(chat_id,
                 f"✅ 血糖已記錄\n\n"
                 f"🩸 {labels[p['sugar_idx']]}：{value}\n"
-                f"時間：{now()}")
+                f"時間：{hk_now().strftime('%H:%M')}")
             # Now ask for uric acid
             pending[chat_id] = {"type": "uric_acid_pending"}
             send_message(chat_id,
                 "🟤 請回覆尿酸值（如：360）\n\n"
-                f"時間：{now()}")
+                f"時間：{hk_now().strftime('%H:%M')}")
             return
 
         elif ptype == "uric_acid_pending":
@@ -352,7 +352,7 @@ def handle_text(text, chat_id):
             send_message(chat_id,
                 f"✅ 尿酸已記錄\n\n"
                 f"🟤 尿酸：{value} μmol/L\n"
-                f"時間：{now().strftime('%H:%M')}")
+                f"時間：{hk_now().strftime('%H:%M')}")
             return
 
         elif ptype == "bp":
@@ -370,7 +370,7 @@ def handle_text(text, chat_id):
                             f"✅ 血壓已記錄\n\n"
                             f"❤️ 收縮壓：{sys_val} mmHg\n"
                             f"💓 舒張壓：{dia_val} mmHg\n"
-                            f"時間：{now()}")
+                            f"時間：{hk_now().strftime('%H:%M')}")
                         return
                     except ValueError:
                         pass
@@ -382,7 +382,7 @@ def handle_text(text, chat_id):
             send_message(chat_id,
                 f"✅ 尿酸已記錄\n\n"
                 f"🟤 尿酸：{value} μmol/L\n"
-                f"時間：{now().strftime('%H:%M')}")
+                f"時間：{hk_now().strftime('%H:%M')}")
             return
 
     # Default: show main menu
@@ -490,7 +490,7 @@ REMINDERS = {
 }
 
 def check_reminders():
-    now = now()
+    now = hk_now()
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
     current_key = f"{today}_{current_time}"
