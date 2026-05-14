@@ -159,7 +159,7 @@ def save_data(data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def record_entry(chat_id, entry_type, value):
-    """Record a health entry for today."""
+    """Record a health entry for today (upsert — replaces same type if exists today)."""
     now = hk_now()
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
@@ -168,6 +168,10 @@ def record_entry(chat_id, entry_type, value):
     if today not in data:
         data[today] = {"records": []}
 
+    # Upsert: remove existing record of same type today, then append new one
+    data[today]["records"] = [
+        r for r in data[today]["records"] if r["type"] != entry_type
+    ]
     record = {
         "time": current_time,
         "type": entry_type,
@@ -219,7 +223,14 @@ def get_today_summary():
         lines.append(f"💓 舒張壓：{dia_bp}")
 
     if uric is not None:
-        lines.append(f"🟤 尿酸：{uric}")
+        u = float(uric)
+        if u < 420:
+            uric_label = f"🟢 尿酸：{uric} μmol/L（正常）"
+        elif u < 540:
+            uric_label = f"🟡 尿酸：{uric} μmol/L（偏高）"
+        else:
+            uric_label = f"🔴 尿酸：{uric} μmol/L（好高）"
+        lines.append(uric_label)
 
     lines.append("")
     lines.append("🔙 返回主菜單")
@@ -349,9 +360,16 @@ def handle_text(text, chat_id):
 
         elif ptype == "uric_acid_pending":
             record_entry(chat_id, "uric_acid", value)
+            u = float(value)
+            if u < 420:
+                uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
+            elif u < 540:
+                uric_label = f"🟡 尿酸：{value} μmol/L（偏高）"
+            else:
+                uric_label = f"🔴 尿酸：{value} μmol/L（好高）"
             send_message(chat_id,
                 f"✅ 尿酸已記錄\n\n"
-                f"🟤 尿酸：{value} μmol/L\n"
+                f"{uric_label}\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
             return
 
@@ -379,9 +397,16 @@ def handle_text(text, chat_id):
 
         elif ptype == "uric_acid":
             record_entry(chat_id, "uric_acid", value)
+            u = float(value)
+            if u < 420:
+                uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
+            elif u < 540:
+                uric_label = f"🟡 尿酸：{value} μmol/L（偏高）"
+            else:
+                uric_label = f"🔴 尿酸：{value} μmol/L（好高）"
             send_message(chat_id,
                 f"✅ 尿酸已記錄\n\n"
-                f"🟤 尿酸：{value} μmol/L\n"
+                f"{uric_label}\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
             return
 
