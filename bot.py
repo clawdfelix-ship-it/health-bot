@@ -412,7 +412,7 @@ def poll_updates():
 
 # ── Reminder scheduler ─────────────────────────────────────────────
 
-last_remind = {}
+last_remind = set()
 
 REMINDERS = {
     "09:30": {
@@ -454,8 +454,8 @@ def check_reminders():
     for t, info in REMINDERS.items():
         if t == current_time:
             key = f"{today}_{t}_{info['key']}"
-            if last_remind.get("key") != key:
-                last_remind["key"] = key
+            if key not in last_remind:
+                last_remind.add(key)
                 send_message(OWNER_ID, info["msg"])
 
 def reminder_loop():
