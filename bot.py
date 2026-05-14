@@ -118,6 +118,7 @@ def record_menu():
     return {"inline_keyboard": [
         [{"text": "🩸 空腹血糖", "callback_data": "sugar_0"}, {"text": "🩸 午後血糖", "callback_data": "sugar_1"}, {"text": "🩸 晚後血糖", "callback_data": "sugar_2"}],
         [{"text": "❤️ 收縮壓", "callback_data": "bp_sys"}, {"text": "💓 舒張壓", "callback_data": "bp_dia"}],
+        [{"text": "🟤 尿酸", "callback_data": "uric_acid"}],
         [{"text": "🔙 返回主菜單", "callback_data": "back"}],
     ]}
 
@@ -185,6 +186,7 @@ def get_today_summary():
     sugars = [None, None, None]   # 0=空腹, 1=午後, 2=晚後
     sys_bp = None
     dia_bp = None
+    uric = None
 
     for r in records:
         t = r["type"]
@@ -194,6 +196,7 @@ def get_today_summary():
         elif t == "sugar_2": sugars[2] = v
         elif t == "bp_sys": sys_bp = v
         elif t == "bp_dia": dia_bp = v
+        elif t == "uric_acid": uric = v
 
     labels = ["空腹血糖", "午後血糖", "晚後血糖"]
     for i, v in enumerate(sugars):
@@ -208,6 +211,9 @@ def get_today_summary():
         lines.append(f"❤️ 收縮壓：{sys_bp}")
     elif dia_bp is not None:
         lines.append(f"💓 舒張壓：{dia_bp}")
+
+    if uric is not None:
+        lines.append(f"🟤 尿酸：{uric}")
 
     lines.append("")
     lines.append("🔙 返回主菜單")
@@ -282,8 +288,8 @@ def handle_callback(callback, chat_id, message_id):
         export_and_send(chat_id, message_id)
         return
 
-    # Sugar / BP entry — initiate pending
-    if data in ("sugar_0", "sugar_1", "sugar_2", "bp_sys", "bp_dia"):
+    # Sugar / BP / Uric Acid entry — initiate pending
+    if data in ("sugar_0", "sugar_1", "sugar_2", "bp_sys", "bp_dia", "uric_acid"):
         pending[chat_id] = {"type": data, "time": datetime.now().strftime("%H:%M")}
         labels = {
             "sugar_0": "🩸 空腹血糖",
@@ -291,6 +297,7 @@ def handle_callback(callback, chat_id, message_id):
             "sugar_2": "🩸 晚後血糖",
             "bp_sys": "❤️ 收縮壓",
             "bp_dia": "💓 舒張壓",
+            "uric_acid": "🟤 尿酸",
         }
         prompt = {
             "sugar_0": "🩸 請回覆空腹血糖值（如：5.2）",
@@ -298,6 +305,7 @@ def handle_callback(callback, chat_id, message_id):
             "sugar_2": "🩸 請回覆晚後血糖值（如：8.1）",
             "bp_sys": "❤️ 請回覆收縮壓（如：125）",
             "bp_dia": "💓 請回覆舒張壓（如：80）",
+            "uric_acid": "🟤 請回覆尿酸值（如：360）",
         }
         edit_message(chat_id, message_id, prompt[data], back_btn())
         return
@@ -323,9 +331,10 @@ def handle_text(text, chat_id):
             "sugar_2": "晚後血糖",
             "bp_sys": "收縮壓",
             "bp_dia": "舒張壓",
+            "uric_acid": "尿酸",
         }
 
-        units = {"sugar_0": "", "sugar_1": "", "sugar_2": "", "bp_sys": "mmHg", "bp_dia": "mmHg"}
+        units = {"sugar_0": "", "sugar_1": "", "sugar_2": "", "bp_sys": "mmHg", "bp_dia": "mmHg", "uric_acid": "μmol/L"}
         send_message(chat_id,
             f"✅ 已記錄\n\n"
             f"{labels[entry_type]}：{value} {units[entry_type]}\n"
@@ -350,9 +359,9 @@ def export_and_send(chat_id, message_id):
         for r in d.get("records", []):
             t = r["type"]
             labels = {"sugar_0": "空腹血糖", "sugar_1": "午後血糖", "sugar_2": "晚後血糖",
-                      "bp_sys": "收縮壓", "bp_dia": "舒張壓"}
+                      "bp_sys": "收縮壓", "bp_dia": "舒張壓", "uric_acid": "尿酸"}
             units = {"sugar_0": "mmol/L", "sugar_1": "mmol/L", "sugar_2": "mmol/L",
-                     "bp_sys": "mmHg", "bp_dia": "mmHg"}
+                     "bp_sys": "mmHg", "bp_dia": "mmHg", "uric_acid": "μmol/L"}
             writer.writerow([date, r["time"], labels.get(t, t), r["value"], units.get(t, "")])
 
     csv_path = os.path.join(DATA_DIR, "health_export.csv")
