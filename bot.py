@@ -123,22 +123,13 @@ def schedule_menu():
 def record_menu():
     return {"inline_keyboard": [
         [{"text": "🩸 空腹血糖", "callback_data": "sugar_0"}, {"text": "🩸 午後血糖", "callback_data": "sugar_1"}, {"text": "🩸 晚後血糖", "callback_data": "sugar_2"}],
-        [{"text": "❤️ 收縮壓", "callback_data": "bp_sys"}, {"text": "💓 舒張壓", "callback_data": "bp_dia"}],
+        [{"text": "❤️ 血壓", "callback_data": "bp"}, {"text": "🟤 尿酸", "callback_data": "uric_acid"}],
         [{"text": "🔙 返回主菜單", "callback_data": "back"}],
     ]}
 
 # ── Pending state (multi-step entry) ─────────────────────────────────
 
-pending = {}   # chat_id -> {"type": "sugar"|"bp", "idx": int, "time": str}
-
-def get_pending_text(pending_type, idx):
-    labels = ["空腹血糖", "午後血糖", "晚後血糖"]
-    if pending_type == "sugar":
-        return f"🩸 請回覆血糖值（如：5.2）\n\n時間：{hk_now().strftime('%H:%M')}"
-    elif pending_type == "bp_sys":
-        return f"❤️ 請回覆收縮壓（如：125）\n\n時間：{hk_now().strftime('%H:%M')}"
-    elif pending_type == "bp_dia":
-        return f"💓 請回覆舒張壓（如：80）\n\n時間：{hk_now().strftime('%H:%M')}"
+pending = {}   # chat_id -> {"type": ..., ...}
 
 # ── Data storage ─────────────────────────────────────────────────────
 
@@ -207,8 +198,11 @@ def get_today_summary():
         elif t == "uric_0":  urics[0]  = v
         elif t == "uric_1":  urics[1]  = v
         elif t == "uric_2":  urics[2]  = v
-        elif t == "bp_sys": sys_bp = v
-        elif t == "bp_dia": dia_bp = v
+        elif t == "bp":
+            if "/" in str(v):
+                parts = str(v).split("/")
+                sys_bp = parts[0]
+                dia_bp = parts[1]
 
     labels = ["空腹血糖", "午後血糖", "晚後血糖"]
 
@@ -317,11 +311,11 @@ def handle_callback(callback, chat_id, message_id):
             back_btn())
         return
 
-    # BP entry — ask for both readings together
-    if data in ("bp_sys", "bp_dia"):
-        pending[chat_id] = {"type": "bp", "bp_type": data}
+    # Blood pressure — single combined input
+    if data == "bp":
+        pending[chat_id] = {"type": "bp"}
         edit_message(chat_id, message_id,
-            "❤️ 請回覆血壓（如：125/80）\n\n時間：" + hk_now().strftime("%H:%M"),
+            "❤️ 請回覆血壓（如：128/79）\n\n格式：上壓/下壓\n時間：" + hk_now().strftime("%H:%M"),
             back_btn())
         return
 
@@ -381,40 +375,28 @@ def handle_text(text, chat_id):
 
         elif ptype == "bp":
             # Blood pressure — device gives both readings like "125/80"
-            if "/" in value:
-                parts = value.split("/")
-                if len(parts) == 2:
-                    sys_val = parts[0].strip()
-                    dia_val = parts[1].strip()
-                    try:
-                        float(sys_val); float(dia_val)
-                        record_entry(chat_id, "bp_sys", sys_val)
-                        record_entry(chat_id, "bp_dia", dia_val)
-                        send_message(chat_id,
-                            f"✅ 血壓已記錄\n\n"
-                            f"❤️ 收縮壓：{sys_val} mmHg\n"
-                            f"💓 舒張壓：{dia_val} mmHg\n"
-                            f"時間：{hk_now().strftime('%H:%M')}")
-                        return
-                    except ValueError:
-                        pass
-            send_message(chat_id, "❌ 請輸入格式如：125/80（收縮壓/舒張壓）")
-            return
-
-        elif ptype == "uric_acid":
-            uric_idx = p.get("uric_idx", 0)
-            uric_types = ["uric_0", "uric_1", "uric_2"]
-            record_entry(chat_id, uric_types[uric_idx], value)
-            u = float(value)
-            if u < 420:
-                uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
-            elif u < 540:
-                uric_label = f"🟡 尿酸：{value} μmol/L（偏高）"
-            else:
-                uric_label = f"🔴 尿酸：{value} μmol/L（好高）"
+            if "/" not in value:
+                send_message(chat_id, "❌ 請輸入格式如：128/79（上壓/下壓）")
+                return
+            parts = value.split("/")
+            if len(parts) != 2:
+                send_message(chat_id, "❌ 請輸入格式如：128/79（上壓/下壓）")
+                return
+            try:
+                sys_val = int(parts[0].strip())
+                dia_val = int(parts[1].strip())
+            except ValueError:
+                send_message(chat_id, "❌ 請輸入數字（如：128/79）")
+                return
+            # Range check
+            if not (60 <= sys_val <= 250 and 40 <= dia_val <= 150):
+                send_message(chat_id, "❌ 數值超出正常範圍（上壓60-250，下壓40-150），請重新輸入")
+                return
+            # Store as single "bp" entry
+            record_entry(chat_id, "bp", f"{sys_val}/{dia_val}")
             send_message(chat_id,
-                f"✅ 尿酸已記錄\n\n"
-                f"{uric_label}\n"
+                f"✅ 血壓已記錄\n\n"
+                f"❤️ 血壓：{sys_val}/{dia_val} mmHg\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
             return
 
@@ -436,9 +418,9 @@ def export_and_send(chat_id, message_id):
         for r in d.get("records", []):
             t = r["type"]
             labels = {"sugar_0": "空腹血糖", "sugar_1": "午後血糖", "sugar_2": "晚後血糖",
-                      "bp_sys": "收縮壓", "bp_dia": "舒張壓", "uric_acid": "尿酸"}
+                      "bp": "血壓", "uric_acid": "尿酸"}
             units = {"sugar_0": "mmol/L", "sugar_1": "mmol/L", "sugar_2": "mmol/L",
-                     "bp_sys": "mmHg", "bp_dia": "mmHg", "uric_acid": "μmol/L"}
+                     "bp": "mmHg", "uric_acid": "μmol/L"}
             writer.writerow([date, r["time"], labels.get(t, t), r["value"], units.get(t, "")])
 
     csv_path = os.path.join(DATA_DIR, "health_export.csv")
@@ -522,11 +504,19 @@ REMINDERS = {
     },
 }
 
+last_remind = set()
+_last_cleared_date = ""
+
 def check_reminders():
+    global last_remind, _last_cleared_date
     now = hk_now()
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
-    current_key = f"{today}_{current_time}"
+
+    # Clear old reminders at midnight to prevent unbounded growth
+    if _last_cleared_date != today:
+        last_remind.clear()
+        _last_cleared_date = today
 
     for t, info in REMINDERS.items():
         if t == current_time:
