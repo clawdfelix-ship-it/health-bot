@@ -17,8 +17,12 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 
 # ── Config ──────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8602095206:AAGpozHncwHvKAwV1MEeH_vc7j1gdhzgCcE")
-OWNER_ID    = "582328026"
+# BOT_TOKEN must come from the environment. Never hardcode it — this is a
+# public repo and a leaked token lets anyone hijack the Telegram bot.
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+OWNER_ID    = os.environ.get("OWNER_ID", "582328026")
 # Persistent storage. /tmp is WIPED on every Zeabur redeploy/restart, so for
 # real durability point DATA_DIR at a mounted persistent volume (e.g. /data),
 # configured in the Zeabur dashboard. Fallback keeps local/dev working.
