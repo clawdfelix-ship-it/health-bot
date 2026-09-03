@@ -7,6 +7,8 @@ Zeabur deployment with long polling.
 import json
 import os
 import time
+import csv
+import io
 import threading
 import urllib.request
 import urllib.parse
@@ -17,7 +19,10 @@ from flask import Flask, request
 # ── Config ──────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8602095206:AAGpozHncwHvKAwV1MEeH_vc7j1gdhzgCcE")
 OWNER_ID    = "582328026"
-DATA_DIR    = "/tmp/hermes_data"
+# Persistent storage. /tmp is WIPED on every Zeabur redeploy/restart, so for
+# real durability point DATA_DIR at a mounted persistent volume (e.g. /data),
+# configured in the Zeabur dashboard. Fallback keeps local/dev working.
+DATA_DIR    = os.environ.get("DATA_DIR", "/tmp/hermes_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── Timezone ────────────────────────────────────────────────────────
@@ -83,6 +88,107 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
     except Exception as e:
         print(f"[ERROR] edit_message: {e}")
 
+def download_file(file_id):
+    """Download a Telegram file (by file_id) and return its raw bytes."""
+    get_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+    q = get_url + "?" + urllib.parse.urlencode({"file_id": file_id})
+    with urllib.request.urlopen(q, timeout=20) as r:
+        meta = json.loads(r.read().decode())
+    file_path = meta.get("result", {}).get("file_path")
+    if not file_path:
+        raise RuntimeError("getFile 冇回傳 file_path")
+    dl = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    with urllib.request.urlopen(dl, timeout=30) as r:
+        return r.read()
+
+def restore_from_csv_bytes(raw_bytes, chat_id):
+    """Rebuild health_data.json from an exported CSV (日期,時間,類型,數值,單位).
+    Accepts both the Chinese labels and the raw type codes (old buggy export)."""
+    label_to_type = {
+        "空腹血糖": "sugar_0", "午後血糖": "sugar_1", "晚後血糖": "sugar_2",
+        "空腹尿酸": "uric_0", "午後尿酸": "uric_1", "晚後尿酸": "uric_2",
+        "尿酸": "uric_acid", "血壓": "bp",
+    }
+    known = {"sugar_0", "sugar_1", "sugar_2", "uric_0", "uric_1", "uric_2",
+             "uric_acid", "bp"}
+
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        send_message(chat_id, "❌ 無法解讀檔案編碼")
+        return
+
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        send_message(chat_id, "❌ CSV 係空嘅")
+        return
+
+    header = [h.strip() for h in rows[0]]
+    try:
+        i_date = header.index("日期")
+        i_time = header.index("時間")
+        i_type = header.index("類型")
+        i_val  = header.index("數值")
+    except ValueError:
+        send_message(chat_id, "❌ CSV 欄位不符（要有 日期/時間/類型/數值）")
+        return
+
+    rebuilt = {}
+    count = 0
+    for row in rows[1:]:
+        if len(row) <= max(i_date, i_time, i_type, i_val):
+            continue
+        date = row[i_date].strip()
+        rtime = row[i_time].strip()
+        label = row[i_type].strip()
+        value = row[i_val].strip()
+        if not date or not value:
+            continue
+        rtype = label_to_type.get(label, label)
+        if rtype not in known:
+            continue
+        rebuilt.setdefault(date, {"records": []})
+        # upsert: replace same type for that day (keeps last occurrence)
+        rebuilt[date]["records"] = [
+            r for r in rebuilt[date]["records"] if r["type"] != rtype
+        ]
+        rebuilt[date]["records"].append({"time": rtime, "type": rtype, "value": value})
+        count += 1
+
+    if count == 0:
+        send_message(chat_id, "❌ CSV 入面搵唔到有效記錄")
+        return
+
+    save_data(rebuilt)
+    days = len(rebuilt)
+    send_message(chat_id,
+        f"✅ 匯入完成\n\n"
+        f"📊 還原 {count} 條記錄，覆蓋 {days} 日\n"
+        f"📁 儲存位置：{DATA_DIR}")
+
+def handle_document(message, chat_id):
+    doc = message.get("document") or {}
+    fname = (doc.get("file_name") or "").lower()
+    file_id = doc.get("file_id")
+    if not file_id:
+        return
+    if not fname.endswith(".csv"):
+        send_message(chat_id, "📎 請傳 CSV 檔（用主菜單「📤 匯出 CSV」產生嘅格式）")
+        return
+    send_message(chat_id, "📥 收到 CSV，正在匯入…")
+    try:
+        raw = download_file(file_id)
+        restore_from_csv_bytes(raw, chat_id)
+    except Exception as e:
+        print(f"[ERROR] restore: {e}")
+        send_message(chat_id, f"❌ 匯入失敗：{e}")
+
 def send_document(chat_id, file_path, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     with open(file_path, "rb") as f:
@@ -108,7 +214,8 @@ def main_menu():
             [{"text": "📋 服藥時間表", "callback_data": "schedule"}],
             [{"text": "📊 記錄血糖/血壓", "callback_data": "record"}],
             [{"text": "📖 今日記錄", "callback_data": "today"}],
-            [{"text": "📤 匯出 CSV", "callback_data": "export_csv"}],
+            [{"text": "📤 匯出 CSV", "callback_data": "export_csv"},
+             {"text": "📥 匯入還原", "callback_data": "import_help"}],
         ]
     }
 
@@ -303,6 +410,16 @@ def handle_callback(callback, chat_id, message_id):
         export_and_send(chat_id, message_id)
         return
 
+    if data == "import_help":
+        edit_message(chat_id, message_id,
+            "📥 <b>匯入還原</b>\n\n"
+            "將之前用「📤 匯出 CSV」備份嘅 <b>health_export.csv</b> 檔案，\n"
+            "直接 send 俾呢個 bot，就會自動匯入還原。\n\n"
+            "⚠️ 匯入會以 CSV 內容取代現有記錄（同日同類型以最新為準）。\n\n"
+            "適用：重新部署後數據被清空時還原歷史。",
+            back_btn())
+        return
+
     # Sugar entry — initiate pending, ask for uric acid after sugar
     if data in ("sugar_0", "sugar_1", "sugar_2"):
         pending[chat_id] = {"type": "sugar", "sugar_idx": int(data.split("_")[1])}
@@ -418,9 +535,13 @@ def export_and_send(chat_id, message_id):
         for r in d.get("records", []):
             t = r["type"]
             labels = {"sugar_0": "空腹血糖", "sugar_1": "午後血糖", "sugar_2": "晚後血糖",
-                      "bp": "血壓", "uric_acid": "尿酸"}
+                      "uric_0": "空腹尿酸", "uric_1": "午後尿酸", "uric_2": "晚後尿酸",
+                      "uric_acid": "尿酸",
+                      "bp": "血壓"}
             units = {"sugar_0": "mmol/L", "sugar_1": "mmol/L", "sugar_2": "mmol/L",
-                     "bp": "mmHg", "uric_acid": "μmol/L"}
+                     "uric_0": "μmol/L", "uric_1": "μmol/L", "uric_2": "μmol/L",
+                     "uric_acid": "μmol/L",
+                     "bp": "mmHg"}
             writer.writerow([date, r["time"], labels.get(t, t), r["value"], units.get(t, "")])
 
     csv_path = os.path.join(DATA_DIR, "health_export.csv")
@@ -456,7 +577,11 @@ def poll_updates():
                 if msg:
                     cid = str(msg.get("chat", {}).get("id", ""))
                     txt = msg.get("text", "")
-                    if cid == OWNER_ID and txt:
+                    if cid != OWNER_ID:
+                        continue
+                    if msg.get("document"):
+                        handle_document(msg, cid)
+                    elif txt:
                         handle_text(txt, cid)
 
                 if cb:
