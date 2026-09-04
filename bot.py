@@ -17,6 +17,28 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 
+# Matplotlib is used for trend charts. Use the non-interactive Agg backend so it
+# works headless on Zeabur (no display server).
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ── Shared type metadata (single source of truth for export / import / charts) ─
+TYPE_LABELS = {
+    "sugar_0": "空腹血糖", "sugar_1": "午後血糖", "sugar_2": "晚後血糖",
+    "uric_0": "空腹尿酸", "uric_1": "午後尿酸", "uric_2": "晚後尿酸",
+    "uric_acid": "尿酸",
+    "bp": "血壓", "weight": "體重",
+}
+TYPE_UNITS = {
+    "sugar_0": "mmol/L", "sugar_1": "mmol/L", "sugar_2": "mmol/L",
+    "uric_0": "μmol/L", "uric_1": "μmol/L", "uric_2": "μmol/L",
+    "uric_acid": "μmol/L",
+    "bp": "mmHg", "weight": "kg",
+}
+# Reverse map: Chinese label -> internal type code (used by CSV import).
+LABEL_TO_TYPE = {v: k for k, v in TYPE_LABELS.items()}
+
 # ── Config ──────────────────────────────────────────────────────────
 # BOT_TOKEN must come from the environment. Never hardcode it — this is a
 # public repo and a leaked token lets anyone hijack the Telegram bot.
@@ -114,13 +136,9 @@ def download_file(file_id):
 def restore_from_csv_bytes(raw_bytes, chat_id):
     """Rebuild health_data.json from an exported CSV (日期,時間,類型,數值,單位).
     Accepts both the Chinese labels and the raw type codes (old buggy export)."""
-    label_to_type = {
-        "空腹血糖": "sugar_0", "午後血糖": "sugar_1", "晚後血糖": "sugar_2",
-        "空腹尿酸": "uric_0", "午後尿酸": "uric_1", "晚後尿酸": "uric_2",
-        "尿酸": "uric_acid", "血壓": "bp",
-    }
-    known = {"sugar_0", "sugar_1", "sugar_2", "uric_0", "uric_1", "uric_2",
-             "uric_acid", "bp"}
+    label_to_type = dict(LABEL_TO_TYPE)
+    label_to_type["尿酸"] = "uric_acid"  # legacy generic uric label
+    known = set(TYPE_LABELS.keys())
 
     text = None
     for enc in ("utf-8-sig", "utf-8", "gbk"):
@@ -222,6 +240,26 @@ def send_document(chat_id, file_path, caption=""):
     except Exception as e:
         print(f"[ERROR] send_document: {e}")
 
+def send_photo(chat_id, file_path, caption=""):
+    """Send a chart/photo (png) via multipart form upload."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(file_path, "rb") as f:
+        photo_data = f.read()
+    boundary = "----HealthBotPhotoBoundary7MA4YWxk"
+    body = f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+    if caption:
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n"
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"trend.png\"\r\nContent-Type: image/png\r\n\r\n"
+    body = body.encode() + photo_data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        urllib.request.urlopen(req, timeout=45)
+    except Exception as e:
+        print(f"[ERROR] send_photo: {e}")
+        # Fallback: tell the user and still send the text stats
+        send_message(chat_id, "⚠️ 圖表傳送失敗，請稍後再試")
+
 # ── Inline keyboards ─────────────────────────────────────────────────
 
 def main_menu():
@@ -229,7 +267,9 @@ def main_menu():
         "inline_keyboard": [
             [{"text": "📋 服藥時間表", "callback_data": "schedule"}],
             [{"text": "📊 記錄血糖/血壓", "callback_data": "record"}],
-            [{"text": "📖 今日記錄", "callback_data": "today"}],
+            [{"text": "📖 今日記錄", "callback_data": "today"},
+             {"text": "📈 趨勢報告", "callback_data": "trend"}],
+            [{"text": "💊 服藥打卡", "callback_data": "meds_today"}],
             [{"text": "📤 匯出 CSV", "callback_data": "export_csv"},
              {"text": "📥 匯入還原", "callback_data": "import_help"}],
         ]
@@ -247,6 +287,7 @@ def record_menu():
     return {"inline_keyboard": [
         [{"text": "🩸 空腹血糖", "callback_data": "sugar_0"}, {"text": "🩸 午後血糖", "callback_data": "sugar_1"}, {"text": "🩸 晚後血糖", "callback_data": "sugar_2"}],
         [{"text": "❤️ 血壓", "callback_data": "bp"}, {"text": "🟤 尿酸", "callback_data": "uric_acid"}],
+        [{"text": "⚖️ 體重", "callback_data": "weight"}],
         [{"text": "🔙 返回主菜單", "callback_data": "back"}],
     ]}
 
@@ -326,6 +367,40 @@ def record_entry(chat_id, entry_type, value):
         save_data(data)
     return record
 
+# ── Safety alerts ───────────────────────────────────────────────────
+# Record-then-warn: the reading is still saved, but dangerously extreme values
+# trigger an immediate prominent alert. Thresholds are conservative clinical
+# red flags (hypertensive crisis, hypo/hyperglycaemia) — they prompt seeking
+# care, they do NOT diagnose.
+def safety_alerts(entry_type, value):
+    """Return a list of warning strings for a freshly-recorded reading (may be empty)."""
+    alerts = []
+    try:
+        if entry_type.startswith("sugar"):
+            s = float(value)
+            if math.isfinite(s):
+                if s < 3.9:
+                    alerts.append("⚠️ <b>低血糖警報</b>：血糖低過 3.9 mmol/L。\n"
+                                  "請即刻食糖/飲甜嘢，15 分鐘後再度；若暈眩、出汗、心慌，盡快求醫。")
+                elif s > 16.7:
+                    alerts.append("⚠️ <b>高血糖警報</b>：血糖高過 16.7 mmol/L。\n"
+                                  "請飲水、注意酮症癥狀（嘔吐、腹痛、呼吸有果味），持續偏高要盡快求醫。")
+        elif entry_type.startswith("uric"):
+            u = float(value)
+            if math.isfinite(u) and u > 540:
+                alerts.append("⚠️ 尿酸持續高過 540 μmol/L 屬明顯超標，建議盡快同醫生跟進。")
+        elif entry_type == "bp":
+            if "/" in str(value):
+                sy, di = str(value).split("/")
+                sy, di = int(sy), int(di)
+                if sy >= 180 or di >= 120:
+                    alerts.append("🚨 <b>血壓急症警報</b>：血壓達到或超過 180/120。\n"
+                                  "若伴隨劇烈頭痛、胸痛、視力模糊、言語不清、手腳無力，<b>即刻召救護車</b>；"
+                                  "否則靜坐休息 5 分鐘後再度一次，仍偏高要立即求醫。")
+    except (ValueError, TypeError):
+        pass
+    return alerts
+
 def get_today_summary():
     """Build today's summary string."""
     now = hk_now()
@@ -343,6 +418,7 @@ def get_today_summary():
     urics  = [None, None, None]
     sys_bp = None
     dia_bp = None
+    weight = None
 
     for r in records:
         t = r["type"]
@@ -353,6 +429,7 @@ def get_today_summary():
         elif t == "uric_0":  urics[0]  = v
         elif t == "uric_1":  urics[1]  = v
         elif t == "uric_2":  urics[2]  = v
+        elif t == "weight": weight = v
         elif t == "bp":
             if "/" in str(v):
                 parts = str(v).split("/")
@@ -390,6 +467,9 @@ def get_today_summary():
     elif dia_bp is not None:
         lines.append(f"💓 舒張壓：{dia_bp}")
 
+    if weight is not None:
+        lines.append(f"⚖️ 體重：{weight} kg")
+
     lines.append("")
     return "\n".join(lines)
 
@@ -405,16 +485,18 @@ def get_schedule_text():
   ⚠️ 和降血壓藥隔夠30分鐘
 
 <b>10:00</b> — 食降血壓藥
-  💊 Amlodipine 2.5mg
-  ✅ 可空腹
+  💊 Amlodipine 5mg 食<b>半粒</b>（=2.5mg）
+  ✅ 每日一次，可空腹
 
 <b>12:00</b> — 食四君子丸
   🍶 空腹，午餐前30分鐘
   ⏰ 食完等半個鐘先食午飯
 
-<b>12:30</b> — 午餐後
-  💊 Metformin 500mg（第一粒）
-  ⚠️ 一定要飯後，絕對唔可以空腹食
+<b>12:30</b> — 午餐時（跟飯食）
+  💊 Metformin 500mg（一粒）
+  💊 Gliclazide 80mg（一粒）
+  ⚠️ 兩隻都要餐時食，唔好空腹
+  ⚠️ Gliclazide 有低血糖風險，要準時食飯
 
 <b>14:00</b> — 小口飲溫水
   💧 隨意，慢慢飲
@@ -426,14 +508,18 @@ def get_schedule_text():
   🍽 清淡少食、唔好食飽
   ⚠️ 少油、唔好炸嘢
 
-<b>晚餐後即時</b> — Metformin 500mg（第二粒）
-  💊 一定要飯後
-  ⚠️ 食完唔好即刻躺平，坐直休息15分鐘
+<b>19:00 晚餐時</b> —
+  💊 Metformin 500mg（一粒）
+  💊 Gliclazide 80mg（一粒）
+  ⚠️ 跟飯食，食完唔好即刻躺平，坐直休息15分鐘
+  ⚠️ Gliclazide 留意低血糖（手抖、出汗、心慌即刻食糖）
 
 ━━━━━━━━━━━━━━━
 ⚠️ <b>全日禁忌</b>
 ❌ 夜晚絕對唔食四君子丸
-❌ 避免燥熱、失眠、夜尿多"""
+❌ 避免燥熱、失眠、夜尿多
+
+<i>劑量根據聖母醫院 2026-06-02 配藥紀錄</i>"""
 
 # ── Update handler ───────────────────────────────────────────────────
 
@@ -511,6 +597,44 @@ def handle_callback(callback, chat_id, message_id):
             back_btn())
         return
 
+    # Weight entry
+    if data == "weight":
+        pending[chat_id] = {"type": "weight"}
+        edit_message(chat_id, message_id,
+            "⚖️ 請回覆體重（kg，如：65.5）\n\n時間：" + hk_now().strftime("%H:%M"),
+            back_btn())
+        return
+
+    # Trend report (7 / 30 days) with chart
+    if data == "trend":
+        edit_message(chat_id, message_id, "📈 請選擇報告時段：",
+            {"inline_keyboard": [
+                [{"text": "📅 最近 7 日", "callback_data": "trend_7"},
+                 {"text": "🗓️ 最近 30 日", "callback_data": "trend_30"}],
+                [{"text": "🔙 返回主菜單", "callback_data": "back"}],
+            ]})
+        return
+    if data in ("trend_7", "trend_30"):
+        days = 7 if data == "trend_7" else 30
+        edit_message(chat_id, message_id, f"📈 正在生成最近 {days} 日報告…", back_btn())
+        send_trend_report(chat_id, days)
+        return
+
+    # Medication check-in
+    if data == "meds_today":
+        edit_message(chat_id, message_id, get_meds_text(), meds_keyboard())
+        return
+    if data.startswith("medtake_"):
+        key = data.split("_", 1)[1]
+        mark_med_taken(key)
+        edit_message(chat_id, message_id, get_meds_text(), meds_keyboard())
+        answer_callback(callback.get("id"), "✅ 已記錄")
+        return
+    if data == "meds_undo":
+        clear_meds_today()
+        edit_message(chat_id, message_id, get_meds_text(), meds_keyboard())
+        return
+
 def handle_text(text, chat_id):
     if chat_id in pending:
         p = pending.pop(chat_id)
@@ -543,6 +667,10 @@ def handle_text(text, chat_id):
                 send_message(chat_id,
                     "❌ 尿酸數值超出合理範圍（50–1500 μmol/L），請重新輸入")
                 return
+            if ptype == "weight" and not (20.0 <= num <= 400.0):
+                send_message(chat_id,
+                    "❌ 體重數值超出合理範圍（20–400 kg），請重新輸入")
+                return
 
         if ptype == "sugar":
             sugar_types  = ["sugar_0", "sugar_1", "sugar_2"]
@@ -553,10 +681,20 @@ def handle_text(text, chat_id):
                 f"✅ 血糖已記錄\n\n"
                 f"🩸 {labels[p['sugar_idx']]}：{value}\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
+            for a in safety_alerts(entry_type, value):
+                send_message(chat_id, a)
             # Now ask for paired uric acid
             pending[chat_id] = {"type": "uric_acid", "uric_idx": p["sugar_idx"]}
             send_message(chat_id,
                 "🟤 請回覆尿酸值（如：360）\n\n"
+                f"時間：{hk_now().strftime('%H:%M')}")
+            return
+
+        elif ptype == "weight":
+            record_entry(chat_id, "weight", value)
+            send_message(chat_id,
+                f"✅ 體重已記錄\n\n"
+                f"⚖️ 體重：{value} kg\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
             return
 
@@ -577,6 +715,8 @@ def handle_text(text, chat_id):
                 f"✅ 尿酸已記錄\n\n"
                 f"{uric_label}\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
+            for a in safety_alerts(uric_types[uric_idx], value):
+                send_message(chat_id, a)
             return
 
         elif ptype == "bp":
@@ -611,6 +751,8 @@ def handle_text(text, chat_id):
                 f"✅ 血壓已記錄\n\n"
                 f"❤️ 血壓：{sys_val}/{dia_val} mmHg\n"
                 f"時間：{hk_now().strftime('%H:%M')}")
+            for a in safety_alerts("bp", f"{sys_val}/{dia_val}"):
+                send_message(chat_id, a)
             return
 
     # Default: show main menu
@@ -629,15 +771,8 @@ def export_and_send(chat_id, message_id):
     for date, d in sorted(data.items(), reverse=True):
         for r in d.get("records", []):
             t = r["type"]
-            labels = {"sugar_0": "空腹血糖", "sugar_1": "午後血糖", "sugar_2": "晚後血糖",
-                      "uric_0": "空腹尿酸", "uric_1": "午後尿酸", "uric_2": "晚後尿酸",
-                      "uric_acid": "尿酸",
-                      "bp": "血壓"}
-            units = {"sugar_0": "mmol/L", "sugar_1": "mmol/L", "sugar_2": "mmol/L",
-                     "uric_0": "μmol/L", "uric_1": "μmol/L", "uric_2": "μmol/L",
-                     "uric_acid": "μmol/L",
-                     "bp": "mmHg"}
-            writer.writerow([date, r["time"], labels.get(t, t), r["value"], units.get(t, "")])
+            writer.writerow([date, r["time"], TYPE_LABELS.get(t, t), r["value"],
+                             TYPE_UNITS.get(t, "")])
 
     csv_path = os.path.join(DATA_DIR, "health_export.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
@@ -645,6 +780,232 @@ def export_and_send(chat_id, message_id):
 
     edit_message(chat_id, message_id, "📤 正在生成 CSV...", back_btn())
     send_document(chat_id, csv_path, "📊 健康數據匯出")
+
+# ── Medication check-in ─────────────────────────────────────────────
+# Tracked separately from health readings (own file) so it doesn't pollute the
+# CSV/chart data. key matches the REMINDERS keys so we can show ⬜/✅ per med.
+MEDS = [
+    ("sijunzi_am",    "09:30", "🍶 四君子丸（起床空腹）"),
+    ("amlodipine",    "10:00", "💊 Amlodipine 2.5mg（半粒，每日一次）"),
+    ("sijunzi_noon",  "12:00", "🍶 四君子丸（午餐前）"),
+    ("metformin_1",   "12:30", "💊 Metformin 500mg（午餐時）"),
+    ("gliclazide_1",  "12:30", "💊 Gliclazide 80mg（午餐時）"),
+    ("metformin_2",   "19:00", "💊 Metformin 500mg（晚餐時）"),
+    ("gliclazide_2",  "19:00", "💊 Gliclazide 80mg（晚餐時）"),
+]
+
+def get_meds_path():
+    return os.path.join(DATA_DIR, "meds_log.json")
+
+def load_meds():
+    path = get_meds_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_meds(data):
+    path = get_meds_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def mark_med_taken(key):
+    today = hk_now().strftime("%Y-%m-%d")
+    ts = hk_now().strftime("%H:%M")
+    with data_lock:
+        data = load_meds()
+        data.setdefault(today, {})[key] = ts
+        save_meds(data)
+
+def clear_meds_today():
+    today = hk_now().strftime("%Y-%m-%d")
+    with data_lock:
+        data = load_meds()
+        data.pop(today, None)
+        save_meds(data)
+
+def get_meds_text():
+    today = hk_now().strftime("%Y-%m-%d")
+    taken = load_meds().get(today, {})
+    lines = ["💊 <b>今日服藥打卡</b> — " + hk_now().strftime("%m月%d日"), ""]
+    done = 0
+    for key, t, label in MEDS:
+        if key in taken:
+            lines.append(f"✅ {label}　<i>{t}（已食 {taken[key]}）</i>")
+            done += 1
+        else:
+            lines.append(f"⬜ {label}　<i>{t}</i>")
+    lines.append("")
+    lines.append(f"進度：{done}/{len(MEDS)}")
+    if done == len(MEDS):
+        lines.append("🎉 今日全部藥物已打卡，做得好！")
+    return "\n".join(lines)
+
+def meds_keyboard():
+    today = hk_now().strftime("%Y-%m-%d")
+    taken = load_meds().get(today, {})
+    rows = []
+    for key, t, label in MEDS:
+        mark = "✅" if key in taken else "⬜"
+        # strip emoji from button label (keep it short)
+        short = label.split(" ", 1)[-1]
+        rows.append([{"text": f"{mark} {t} {short}", "callback_data": f"medtake_{key}"}])
+    rows.append([{"text": "♻️ 重置今日打卡", "callback_data": "meds_undo"},
+                 {"text": "🔙 返回主菜單", "callback_data": "back"}])
+    return {"inline_keyboard": rows}
+
+# ── Trend report + chart ────────────────────────────────────────────
+
+def collect_series(days):
+    """Return (dates, {metric: [values]}) for the last `days` days (None = no reading)."""
+    data = load_data()
+    today = hk_now().date()
+    start = today - timedelta(days=days - 1)
+    dates, sugar, uric, sysv, diav, wt = [], [], [], [], [], []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        ds = d.strftime("%Y-%m-%d")
+        dates.append(d)
+        su, ur = [], []
+        sy = di = w = None
+        for r in data.get(ds, {}).get("records", []):
+            t, v = r["type"], r["value"]
+            try:
+                if t.startswith("sugar_"):
+                    su.append(float(v))
+                elif t.startswith("uric_"):
+                    ur.append(float(v))
+                elif t == "weight":
+                    w = float(v)
+                elif t == "bp" and "/" in str(v):
+                    p = str(v).split("/")
+                    sy, di = int(p[0]), int(p[1])
+            except (ValueError, TypeError):
+                pass
+        sugar.append(sum(su) / len(su) if su else None)
+        uric.append(sum(ur) / len(ur) if ur else None)
+        sysv.append(sy); diav.append(di); wt.append(w)
+    return dates, {"sugar": sugar, "uric": uric, "sys": sysv, "dia": diav, "weight": wt}
+
+def _stats(vals):
+    """(count, avg, min, max) over finite, non-None values."""
+    xs = [v for v in vals if v is not None and math.isfinite(v)]
+    if not xs:
+        return None
+    return len(xs), sum(xs) / len(xs), min(xs), max(xs)
+
+def build_trend_chart(dates, series, path):
+    """Draw a 4-panel trend chart. English labels to avoid CJK-font tofu on the server."""
+    x = list(range(len(dates)))
+    xticks = x
+    xlabels = [d.strftime("%m/%d") for d in dates]
+    # thin out labels if many days
+    step = max(1, len(dates) // 8)
+
+    fig, axes = plt.subplots(4, 1, figsize=(9, 12), sharex=True)
+    fig.suptitle(f"Health Trend — last {len(dates)} days", fontsize=14, fontweight="bold")
+
+    def plot(ax, pts, color, ylabel, marker="o"):
+        px = [i for i, v in zip(x, pts) if v is not None]
+        py = [v for v in pts if v is not None]
+        if px:
+            ax.plot(px, py, marker=marker, color=color, linewidth=1.5, markersize=4)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels(xlabels[::step], rotation=45, ha="right", fontsize=8)
+
+    plot(axes[0], series["sugar"], "#e74c3c", "Glucose\n(mmol/L)")
+    axes[0].axhspan(3.9, 7.0, color="#2ecc71", alpha=0.12)  # rough normal band
+    plot(axes[1], series["sys"], "#c0392b", "BP (mmHg)")
+    plot(axes[1], series["dia"], "#3498db", "BP (mmHg)")
+    axes[1].legend(["Systolic", "Diastolic"], fontsize=8, loc="upper right")
+    plot(axes[2], series["uric"], "#8e44ad", "Uric acid\n(umol/L)")
+    axes[2].axhline(420, color="#f39c12", linestyle="--", linewidth=0.8, alpha=0.7)
+    plot(axes[3], series["weight"], "#16a085", "Weight\n(kg)", marker="s")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+def send_trend_report(chat_id, days):
+    dates, series = collect_series(days)
+    has_any = any(any(v is not None for v in series[k]) for k in series)
+    if not has_any:
+        send_message(chat_id, f"📈 最近 {days} 日暫時冇健康記錄，先去「📊 記錄」低啲數據啦。")
+        return
+
+    # Text stats
+    def fmt(st, unit, nd=1):
+        if st is None:
+            return "暫無數據"
+        n, avg, mn, mx = st
+        return f"平均 {avg:.{nd}f}　最低 {mn:.{nd}f}　最高 {mx:.{nd}f} {unit}（{n} 日）"
+
+    # Abnormal counts
+    high_bp = sum(1 for s, d_ in zip(series["sys"], series["dia"]) if s is not None and (s >= 140 or (d_ or 0) >= 90))
+    low_sugar = sum(1 for v in series["sugar"] if v is not None and v < 3.9)
+    high_sugar = sum(1 for v in series["sugar"] if v is not None and v > 16.7)
+    high_uric = sum(1 for v in series["uric"] if v is not None and v > 540)
+
+    caption = (
+        f"📈 <b>最近 {days} 日健康報告</b>\n\n"
+        f"🩸 <b>血糖</b>\n{fmt(_stats(series['sugar']), 'mmol/L')}\n"
+        f"   低血糖 {low_sugar} 日、極高血糖 {high_sugar} 日\n\n"
+        f"❤️ <b>血壓</b>\n上壓 {fmt(_stats(series['sys']), 'mmHg', 0)}\n"
+        f"下壓 {fmt(_stats(series['dia']), 'mmHg', 0)}\n   偏高（≥140/90）{high_bp} 日\n\n"
+        f"🟤 <b>尿酸</b>\n{fmt(_stats(series['uric']), 'μmol/L', 0)}\n   明確超標（>540）{high_uric} 日\n\n"
+        f"⚖️ <b>體重</b>\n{fmt(_stats(series['weight']), 'kg')}\n\n"
+        f"<i>圖表入面綠色帶係血糖大致正常區間，紫線虛線係尿酸 420 參考線。</i>"
+    )
+
+    chart_path = os.path.join(DATA_DIR, "trend.png")
+    try:
+        build_trend_chart(dates, series, chart_path)
+        send_photo(chat_id, chart_path, caption)
+    except Exception as e:
+        print(f"[ERROR] trend chart: {e}")
+        send_message(chat_id, caption)
+
+# ── Weekly auto-backup ──────────────────────────────────────────────
+
+_last_backup_week = ""
+
+def check_weekly_backup():
+    """Every Monday morning, auto-send a fresh CSV export to the owner (safety net)."""
+    global _last_backup_week
+    now = hk_now()
+    if now.weekday() != 0:   # 0 = Monday
+        return
+    if now.hour < 9:
+        return
+    week_tag = now.strftime("%Y-W%W")
+    if _last_backup_week == week_tag:
+        return
+    data = load_data()
+    if not data:
+        _last_backup_week = week_tag
+        return
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["日期", "時間", "類型", "數值", "單位"])
+    for date, d in sorted(data.items(), reverse=True):
+        for r in d.get("records", []):
+            t = r["type"]
+            writer.writerow([date, r["time"], TYPE_LABELS.get(t, t), r["value"],
+                             TYPE_UNITS.get(t, "")])
+    csv_path = os.path.join(DATA_DIR, "health_export.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(output.getvalue())
+    send_document(OWNER_ID, csv_path, f"📦 每週自動備份（{now.strftime('%Y-%m-%d')}）")
+    _last_backup_week = week_tag
 
 # ── Telegram polling ───────────────────────────────────────────────
 
@@ -697,7 +1058,7 @@ REMINDERS = {
         "key": "sijunzi_am",
     },
     "10:00": {
-        "msg": "⏰ 10:00 — 食降血壓藥\n\n💊 Amlodipine 2.5mg（可空腹）",
+        "msg": "⏰ 10:00 — 食降血壓藥\n\n💊 Amlodipine 5mg 食<b>半粒</b>（=2.5mg），每日一次（可空腹）",
         "key": "amlodipine",
     },
     "12:00": {
@@ -705,7 +1066,7 @@ REMINDERS = {
         "key": "sijunzi_noon",
     },
     "12:30": {
-        "msg": "⏰ 12:30 — 午餐後\n\n💊 Metformin 500mg（第一粒）\n⚠️ 一定要飯後，絕對唔可以空腹食！",
+        "msg": "⏰ 12:30 — 午餐時（跟飯食）\n\n💊 Metformin 500mg（一粒）\n💊 Gliclazide 80mg（一粒）\n⚠️ 兩隻都要<b>餐時</b>食，唔好空腹；Gliclazide 有低血糖風險，記得準時食飯",
         "key": "metformin_1",
     },
     "14:00": {
@@ -717,7 +1078,7 @@ REMINDERS = {
         "key": "water_late",
     },
     "19:00": {
-        "msg": "⏰ 19:00 — 晚餐後 Metformin\n\n💊 Metformin 500mg（第二粒）\n⚠️ 一定要飯後，食完唔好即刻躺平！",
+        "msg": "⏰ 19:00 — 晚餐時（跟飯食）\n\n💊 Metformin 500mg（一粒）\n💊 Gliclazide 80mg（一粒）\n⚠️ 餐時食，食完唔好即刻躺平；Gliclazide 留意低血糖",
         "key": "metformin_2",
     },
 }
@@ -755,6 +1116,10 @@ def reminder_loop():
         now = time.time()
         if now - last_check >= 60:
             check_reminders()
+            try:
+                check_weekly_backup()
+            except Exception as e:
+                print(f"[WARN] weekly backup: {e}")
             last_check = now
         time.sleep(30)
 
