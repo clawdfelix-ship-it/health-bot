@@ -9,6 +9,7 @@ import os
 import time
 import csv
 import io
+import math
 import threading
 import urllib.request
 import urllib.parse
@@ -22,7 +23,12 @@ from flask import Flask, request
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
-OWNER_ID    = os.environ.get("OWNER_ID", "582328026")
+# Owner chat id must come from the environment — never hardcode it in a public
+# repo. Accept OWNER_ID (current) or legacy OWNER_CHAT_ID (already set on Zeabur).
+OWNER_ID = os.environ.get("OWNER_ID") or os.environ.get("OWNER_CHAT_ID") or ""
+if not OWNER_ID:
+    raise RuntimeError("OWNER_ID (or OWNER_CHAT_ID) environment variable is required")
+OWNER_ID = str(OWNER_ID)
 # Persistent storage. /tmp is WIPED on every Zeabur redeploy/restart, so for
 # real durability point DATA_DIR at a mounted persistent volume (e.g. /data),
 # configured in the Zeabur dashboard. Fallback keeps local/dev working.
@@ -169,12 +175,18 @@ def restore_from_csv_bytes(raw_bytes, chat_id):
         send_message(chat_id, "❌ CSV 入面搵唔到有效記錄")
         return
 
-    save_data(rebuilt)
+    # Back up the current data file BEFORE the destructive full-replace, so an
+    # old CSV can't silently wipe newer records — user can restore the .bak.
+    bak_path = backup_data_file("preimport.bak")
+
+    with data_lock:
+        save_data(rebuilt)
     days = len(rebuilt)
+    bak_note = f"\n💾 匯入前已自動備份：{os.path.basename(bak_path)}" if bak_path else ""
     send_message(chat_id,
         f"✅ 匯入完成\n\n"
         f"📊 還原 {count} 條記錄，覆蓋 {days} 日\n"
-        f"📁 儲存位置：{DATA_DIR}")
+        f"📁 儲存位置：{DATA_DIR}{bak_note}")
 
 def handle_document(message, chat_id):
     doc = message.get("document") or {}
@@ -244,20 +256,56 @@ pending = {}   # chat_id -> {"type": ..., ...}
 
 # ── Data storage ─────────────────────────────────────────────────────
 
+# One lock guards the whole load→modify→save cycle. The poll thread and the
+# reminder thread both touch storage; without this, a record and a CSV import
+# racing each other could interleave writes.
+data_lock = threading.Lock()
+
 def get_data_path():
     return os.path.join(DATA_DIR, "health_data.json")
 
 def load_data():
     path = get_data_path()
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return {}
+    try:
         with open(path) as f:
             return json.load(f)
-    return {}
+    except (json.JSONDecodeError, OSError) as e:
+        # A corrupt/half-written file must never crash the bot or nuke history.
+        # Park the bad file for inspection and start fresh.
+        print(f"[ERROR] data file unreadable ({e}); backing up and starting empty")
+        try:
+            os.replace(path, f"{path}.corrupt.{int(time.time())}")
+        except OSError:
+            pass
+        return {}
 
 def save_data(data):
+    # Atomic write: dump to a temp file in the SAME directory, then os.replace()
+    # it over the real file. os.replace is atomic on POSIX, so a crash or a
+    # second concurrent writer can never leave a truncated half-JSON behind
+    # (which would make load_data() blow up and lose every past record).
     path = get_data_path()
-    with open(path, "w") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def backup_data_file(tag="bak"):
+    """Copy the current health_data.json aside before a destructive op (CSV import)."""
+    path = get_data_path()
+    if os.path.exists(path):
+        bak = f"{path}.{tag}"
+        try:
+            with open(path) as src, open(bak, "w") as dst:
+                dst.write(src.read())
+            return bak
+        except OSError as e:
+            print(f"[WARN] backup failed: {e}")
+    return None
 
 def record_entry(chat_id, entry_type, value):
     """Record a health entry for today (upsert — replaces same type if exists today)."""
@@ -265,21 +313,17 @@ def record_entry(chat_id, entry_type, value):
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
 
-    data = load_data()
-    if today not in data:
-        data[today] = {"records": []}
-
-    # Upsert: remove existing record of same type today, then append new one
-    data[today]["records"] = [
-        r for r in data[today]["records"] if r["type"] != entry_type
-    ]
-    record = {
-        "time": current_time,
-        "type": entry_type,
-        "value": value,
-    }
-    data[today]["records"].append(record)
-    save_data(data)
+    record = {"time": current_time, "type": entry_type, "value": value}
+    with data_lock:
+        data = load_data()
+        if today not in data:
+            data[today] = {"records": []}
+        # Upsert: remove existing record of same type today, then append new one
+        data[today]["records"] = [
+            r for r in data[today]["records"] if r["type"] != entry_type
+        ]
+        data[today]["records"].append(record)
+        save_data(data)
     return record
 
 def get_today_summary():
@@ -318,7 +362,12 @@ def get_today_summary():
     labels = ["空腹血糖", "午後血糖", "晚後血糖"]
 
     def uric_tier(v):
-        u = float(v)
+        try:
+            u = float(v)
+        except (TypeError, ValueError):
+            return "⚪"
+        if not math.isfinite(u):
+            return "⚪"
         if u < 420:   return "🟢"
         if u < 540:   return "🟡"
         return "🔴"
@@ -342,7 +391,6 @@ def get_today_summary():
         lines.append(f"💓 舒張壓：{dia_bp}")
 
     lines.append("")
-    lines.append("🔙 返回主菜單")
     return "\n".join(lines)
 
 # ── Schedule display ────────────────────────────────────────────────
@@ -441,9 +489,25 @@ def handle_callback(callback, chat_id, message_id):
         return
 
     if data == "uric_acid":
-        pending[chat_id] = {"type": "uric_acid"}
+        # Standalone uric acid: ask WHICH slot it belongs to (空腹/午後/晚後),
+        # otherwise it would always overwrite the fasting slot (uric_0) and the
+        # other two slots could only ever be filled via the paired sugar flow.
         edit_message(chat_id, message_id,
-            "🟤 請回覆尿酸值（如：360）\n\n時間：" + hk_now().strftime("%H:%M"),
+            "🟤 邊個時段嘅尿酸？",
+            {"inline_keyboard": [
+                [{"text": "🌅 空腹尿酸", "callback_data": "uricpick_0"},
+                 {"text": "🌞 午後尿酸", "callback_data": "uricpick_1"},
+                 {"text": "🌙 晚後尿酸", "callback_data": "uricpick_2"}],
+                [{"text": "🔙 返回主菜單", "callback_data": "back"}],
+            ]})
+        return
+
+    if data in ("uricpick_0", "uricpick_1", "uricpick_2"):
+        idx = int(data.split("_")[1])
+        pending[chat_id] = {"type": "uric_acid", "uric_idx": idx}
+        slot = ["空腹", "午後", "晚後"][idx]
+        edit_message(chat_id, message_id,
+            f"🟤 請回覆{slot}尿酸值（如：360）\n\n時間：" + hk_now().strftime("%H:%M"),
             back_btn())
         return
 
@@ -453,19 +517,35 @@ def handle_text(text, chat_id):
         ptype = p["type"]
         value = text.strip()
 
-        # Validate single-number entries. Blood pressure uses "上壓/下壓"
-        # (e.g. 128/79) which isn't a single float — it has its own parser
-        # further down, so skip the generic float check for it.
-        if ptype != "bp":
+        def parse_finite(s):
+            """float() that also rejects nan/inf and non-numeric junk. Returns None on bad input."""
             try:
-                float(value)
-            except ValueError:
+                x = float(s)
+            except (ValueError, TypeError):
+                return None
+            return x if math.isfinite(x) else None
+
+        # Validate single-number entries. Blood pressure uses "上壓/下壓"
+        # (e.g. 128/79) which isn't a single float — it has its own parser below.
+        if ptype != "bp":
+            num = parse_finite(value)
+            if num is None:
                 send_message(chat_id, "❌ 數值格式錯誤，請重新輸入（如：5.2）")
+                return
+            # Physiologically-plausible ranges guard against fat-finger typos
+            # (e.g. typing 52 instead of 5.2) that would poison health trends.
+            if ptype == "sugar" and not (2.0 <= num <= 30.0):
+                send_message(chat_id,
+                    "❌ 血糖數值超出合理範圍（2–30 mmol/L），請重新輸入\n"
+                    "（如真實數值確係咁，請聯絡醫生）")
+                return
+            if ptype == "uric_acid" and not (50.0 <= num <= 1500.0):
+                send_message(chat_id,
+                    "❌ 尿酸數值超出合理範圍（50–1500 μmol/L），請重新輸入")
                 return
 
         if ptype == "sugar":
             sugar_types  = ["sugar_0", "sugar_1", "sugar_2"]
-            uric_types   = ["uric_0",  "uric_1",  "uric_2"]
             entry_type   = sugar_types[p["sugar_idx"]]
             record_entry(chat_id, entry_type, value)
             labels = ["空腹血糖", "午後血糖", "晚後血糖"]
@@ -485,12 +565,14 @@ def handle_text(text, chat_id):
             uric_types = ["uric_0", "uric_1", "uric_2"]
             record_entry(chat_id, uric_types[uric_idx], value)
             u = float(value)
+            slot_labels = ["空腹", "午後", "晚後"]
+            slot = slot_labels[uric_idx]
             if u < 420:
-                uric_label = f"🟢 尿酸：{value} μmol/L（正常）"
+                uric_label = f"🟢 {slot}尿酸：{value} μmol/L（正常）"
             elif u < 540:
-                uric_label = f"🟡 尿酸：{value} μmol/L（偏高）"
+                uric_label = f"🟡 {slot}尿酸：{value} μmol/L（偏高）"
             else:
-                uric_label = f"🔴 尿酸：{value} μmol/L（好高）"
+                uric_label = f"🔴 {slot}尿酸：{value} μmol/L（好高）"
             send_message(chat_id,
                 f"✅ 尿酸已記錄\n\n"
                 f"{uric_label}\n"
@@ -512,9 +594,16 @@ def handle_text(text, chat_id):
             except ValueError:
                 send_message(chat_id, "❌ 請輸入數字（如：128/79）")
                 return
-            # Range check
+            # Range check (each reading independently)
             if not (60 <= sys_val <= 250 and 40 <= dia_val <= 150):
                 send_message(chat_id, "❌ 數值超出正常範圍（上壓60-250，下壓40-150），請重新輸入")
+                return
+            # Systolic must exceed diastolic — if not, the two were almost
+            # certainly typed in reverse (e.g. 80/120).
+            if sys_val <= dia_val:
+                send_message(chat_id,
+                    "❌ 上壓（收縮壓）必須大過下壓（舒張壓）。\n"
+                    "你可能打反咗，請按 上壓/下壓 重新輸入（如：128/79）")
                 return
             # Store as single "bp" entry
             record_entry(chat_id, "bp", f"{sys_val}/{dia_val}")
@@ -533,7 +622,6 @@ def export_and_send(chat_id, message_id):
         edit_message(chat_id, message_id, "📤 沒有數據可匯出", back_btn())
         return
 
-    import csv, io
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["日期", "時間", "類型", "數值", "單位"])
@@ -603,8 +691,6 @@ def poll_updates():
 
 # ── Reminder scheduler ─────────────────────────────────────────────
 
-last_remind = set()
-
 REMINDERS = {
     "09:30": {
         "msg": "⏰ 09:30 — 起床時間！\n\n💧 飲幾小口溫水\n→ 🍶 食四君子丸（空腹）\n⚠️ 和降血壓藥隔30分鐘",
@@ -643,7 +729,9 @@ def check_reminders():
     global last_remind, _last_cleared_date
     now = hk_now()
     today = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M")
+    # Current minute as an int (HH*60+MM) so we can compare with <= instead of
+    # exact string equality.
+    cur_min = now.hour * 60 + now.minute
 
     # Clear old reminders at midnight to prevent unbounded growth
     if _last_cleared_date != today:
@@ -651,11 +739,15 @@ def check_reminders():
         _last_cleared_date = today
 
     for t, info in REMINDERS.items():
-        if t == current_time:
-            key = f"{today}_{t}_{info['key']}"
-            if key not in last_remind:
-                last_remind.add(key)
-                send_message(OWNER_ID, info["msg"])
+        hh, mm = t.split(":")
+        remind_min = int(hh) * 60 + int(mm)
+        key = f"{today}_{t}_{info['key']}"
+        # Fire once the clock reaches (or drifts past) the reminder minute.
+        # Exact-match (t == current_time) could skip a whole reminder if the
+        # 30s poll drifted past that minute — dangerous for medication alerts.
+        if cur_min >= remind_min and key not in last_remind:
+            last_remind.add(key)
+            send_message(OWNER_ID, info["msg"])
 
 def reminder_loop():
     last_check = 0
