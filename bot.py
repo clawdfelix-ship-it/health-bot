@@ -453,12 +453,15 @@ def handle_text(text, chat_id):
         ptype = p["type"]
         value = text.strip()
 
-        # Validate
-        try:
-            float(value)
-        except ValueError:
-            send_message(chat_id, "❌ 數值格式錯誤，請重新輸入（如：5.2）")
-            return
+        # Validate single-number entries. Blood pressure uses "上壓/下壓"
+        # (e.g. 128/79) which isn't a single float — it has its own parser
+        # further down, so skip the generic float check for it.
+        if ptype != "bp":
+            try:
+                float(value)
+            except ValueError:
+                send_message(chat_id, "❌ 數值格式錯誤，請重新輸入（如：5.2）")
+                return
 
         if ptype == "sugar":
             sugar_types  = ["sugar_0", "sugar_1", "sugar_2"]
