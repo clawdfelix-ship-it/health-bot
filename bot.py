@@ -223,20 +223,21 @@ def handle_document(message, chat_id):
         print(f"[ERROR] restore: {e}")
         send_message(chat_id, f"❌ 匯入失敗：{e}")
 
-def send_document(chat_id, file_path, caption=""):
+def send_document(chat_id, file_path, caption="", filename=None, content_type="text/csv"):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     with open(file_path, "rb") as f:
-        photo_data = f.read()
+        file_data = f.read()
+    fname = filename or os.path.basename(file_path)
     boundary = "----HealthBotBoundary7MA4YWxkTrZu0gW"
     body = f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
     if caption:
         body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n"
-    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"health_export.csv\"\r\nContent-Type: text/csv\r\n\r\n"
-    body = body.encode() + photo_data + f"\r\n--{boundary}--\r\n".encode()
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{fname}\"\r\nContent-Type: {content_type}\r\n\r\n"
+    body = body.encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(url, data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        urllib.request.urlopen(req, timeout=30)
+        urllib.request.urlopen(req, timeout=60)
     except Exception as e:
         print(f"[ERROR] send_document: {e}")
 
@@ -611,6 +612,7 @@ def handle_callback(callback, chat_id, message_id):
             {"inline_keyboard": [
                 [{"text": "📅 最近 7 日", "callback_data": "trend_7"},
                  {"text": "🗓️ 最近 30 日", "callback_data": "trend_30"}],
+                [{"text": "📄 就醫報告 PDF（90 日）", "callback_data": "clinic_90"}],
                 [{"text": "🔙 返回主菜單", "callback_data": "back"}],
             ]})
         return
@@ -618,6 +620,14 @@ def handle_callback(callback, chat_id, message_id):
         days = 7 if data == "trend_7" else 30
         edit_message(chat_id, message_id, f"📈 正在生成最近 {days} 日報告…", back_btn())
         send_trend_report(chat_id, days)
+        return
+    if data.startswith("clinic_"):
+        try:
+            cdays = int(data.split("_", 1)[1])
+        except (ValueError, IndexError):
+            cdays = 90
+        edit_message(chat_id, message_id, f"📄 正在產生最近 {cdays} 日就醫報告 PDF…", back_btn())
+        send_clinic_report(chat_id, cdays)
         return
 
     # Medication check-in
@@ -974,6 +984,179 @@ def send_trend_report(chat_id, days):
         print(f"[ERROR] trend chart: {e}")
         send_message(chat_id, caption)
 
+# ── Clinic / medical-visit report (PDF) ─────────────────────────────
+# One-tap export for doctor visits: a full-period trend chart + summary
+# stats + a chronological list of abnormal events. Text is English so it
+# renders on the server (no CJK-font issues) and is readable by clinicians.
+def abnormal_events(days):
+    """Collect dated abnormal readings (BP crisis, hypo/hyperglycaemia, high uric)."""
+    data = load_data()
+    today = hk_now().date()
+    start = today - timedelta(days=days - 1)
+    events = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        ds = d.strftime("%Y-%m-%d")
+        for r in data.get(ds, {}).get("records", []):
+            t, v = r["type"], r["value"]
+            label = TYPE_LABELS.get(t, t)
+            try:
+                if t.startswith("sugar_"):
+                    s = float(v)
+                    if s < 3.9:
+                        events.append((ds, r.get("time", ""), label, f"{s} mmol/L LOW glucose (hypo)"))
+                    elif s > 16.7:
+                        events.append((ds, r.get("time", ""), label, f"{s} mmol/L HIGH glucose"))
+                elif t.startswith("uric_") or t == "uric_acid":
+                    u = float(v)
+                    if u > 540:
+                        events.append((ds, r.get("time", ""), label, f"{u} umol/L very high uric acid"))
+                elif t == "bp" and "/" in str(v):
+                    sy, di = [int(x) for x in str(v).split("/")[:2]]
+                    if sy >= 180 or di >= 120:
+                        events.append((ds, r.get("time", ""), label, f"{sy}/{di} mmHg BP CRISIS"))
+                    elif sy >= 140 or di >= 90:
+                        events.append((ds, r.get("time", ""), label, f"{sy}/{di} mmHg elevated BP"))
+            except (ValueError, TypeError):
+                pass
+    return events
+
+def build_clinic_pdf(dates, series, events, path, days):
+    """Render a printable clinic report PDF (English to avoid CJK tofu)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas
+
+    chart_path = os.path.join(DATA_DIR, "clinic_trend.png")
+    build_trend_chart(dates, series, chart_path)
+
+    c = canvas.Canvas(path, pagesize=A4)
+    w, h = A4
+    y = h - 20 * mm
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20 * mm, y, "Health Report — HK Bank League player")
+    y -= 7 * mm
+    c.setFont("Helvetica", 10)
+    rng = f"{dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')} ({days} days)"
+    c.drawString(20 * mm, y, f"Generated: {hk_now().strftime('%Y-%m-%d %H:%M')} HKT   |   Period: {rng}")
+    y -= 8 * mm
+
+    # Summary stats
+    def stat_line(label, st, unit):
+        nonlocal y
+        if st is None:
+            return
+        n, avg, mn, mx = st
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(20 * mm, y, label)
+        c.setFont("Helvetica", 10)
+        c.drawString(70 * mm, y, f"avg {avg:.1f}   min {mn:.1f}   max {mx:.1f} {unit}  ({n} days)")
+        y -= 6 * mm
+
+    stat_line("Glucose (fasting/etc avg)", _stats(series["sugar"]), "mmol/L")
+    stat_line("BP systolic", _stats(series["sys"]), "mmHg")
+    stat_line("BP diastolic", _stats(series["dia"]), "mmHg")
+    stat_line("Uric acid", _stats(series["uric"]), "umol/L")
+    stat_line("Weight", _stats(series["weight"]), "kg")
+    y -= 4 * mm
+
+    # Chart (fit width)
+    try:
+        from reportlab.lib.utils import ImageReader
+        img = ImageReader(chart_path)
+        iw, ih = img.getSize()
+        draw_w = w - 40 * mm
+        draw_h = draw_w * ih / iw
+        max_h = 130 * mm
+        if draw_h > max_h:
+            draw_h = max_h
+            draw_w = draw_h * iw / ih
+        c.drawImage(img, 20 * mm, y - draw_h, width=draw_w, height=draw_h)
+        y -= draw_h + 6 * mm
+    except Exception as e:
+        print(f"[ERROR] pdf chart embed: {e}")
+
+    # Abnormal events list (new page if needed)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(20 * mm, y, f"Abnormal events ({len(events)})")
+    y -= 6 * mm
+    c.setFont("Helvetica", 8.5)
+    if not events:
+        c.drawString(20 * mm, y, "No threshold-crossing events recorded in this period.")
+    else:
+        for ds, tm, label, msg in events:
+            if y < 20 * mm:
+                c.showPage()
+                y = h - 20 * mm
+                c.setFont("Helvetica", 8.5)
+            c.setFillColor(colors.HexColor("#b91c1c") if "CRISIS" in msg or "LOW" in msg else colors.HexColor("#92400e"))
+            c.drawString(20 * mm, y, f"{ds} {tm}  [{label}]  {msg}")
+            c.setFillColor(colors.black)
+            y -= 4.5 * mm
+
+    c.showPage()
+    c.save()
+
+def send_clinic_report(chat_id, days=90):
+    dates, series = collect_series(days)
+    has_any = any(any(v is not None for v in series[k]) for k in series)
+    if not has_any:
+        send_message(chat_id, f"📄 最近 {days} 日冇健康記錄，未能產生報告。")
+        return
+    try:
+        events = abnormal_events(days)
+        pdf_path = os.path.join(DATA_DIR, "clinic_report.pdf")
+        build_clinic_pdf(dates, series, events, pdf_path, days)
+        send_message(chat_id,
+            f"📄 <b>就醫報告（最近 {days} 日）</b>\n"
+            f"包含整段走勢圖、平均/最高/最低、同 {len(events)} 項異常事件，可直接打印帶去見醫護。")
+        send_document(chat_id, pdf_path,
+            caption=f"Health report — last {days} days",
+            filename="health_report.pdf",
+            content_type="application/pdf")
+    except Exception as e:
+        print(f"[ERROR] clinic report: {e}")
+        send_message(chat_id, "❌ 報告產生失敗，請稍後再試。")
+
+# ── Sustained-trend alerts (not just one-off spikes) ────────────────
+# Runs in the reminder loop; at most once per day per metric. Flags a
+# *pattern* (e.g. most of the last week elevated) rather than a single reading.
+_last_trend_alert_date = ""
+
+def check_trend_alerts():
+    global _last_trend_alert_date
+    now = hk_now()
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < 18:          # run once in the evening
+        return
+    if _last_trend_alert_date == today:
+        return
+    try:
+        dates, series = collect_series(7)
+        notes = []
+        # BP: elevated (>=140/90) on at least 5 of the days with readings
+        bp_days = [(s, d_) for s, d_ in zip(series["sys"], series["dia"]) if s is not None]
+        if len(bp_days) >= 5:
+            high = sum(1 for s, d_ in bp_days if s >= 140 or (d_ or 0) >= 90)
+            if high >= 5:
+                notes.append("❤️ <b>血壓連續偏高</b>：過去 7 日有 5 日或以上上壓 ≥140 或下壓 ≥90。\n建議記低同醫生講，並留意定時服降血壓藥。")
+        # Fasting glucose: 5+ days above 7
+        fast_high = sum(1 for v in series["sugar"] if v is not None and v > 7.0)
+        if fast_high >= 5:
+            notes.append("🩸 <b>血糖持續偏高</b>：過去 7 日有 5 日或以上平均血糖高於 7.0 mmol/L。\n建議檢查餐時降糖藥有冇跟飯食，並同醫生跟進。")
+        # Uric: 2+ days above 540 in the week
+        uric_high = sum(1 for v in series["uric"] if v is not None and v > 540)
+        if uric_high >= 2:
+            notes.append("🟤 <b>尿酸反覆超標</b>：過去 7 日有 2 日或以上高於 540 μmol/L。\n建議戒口（少酒、少內臟/海鮮）並同醫生跟進。")
+        if notes:
+            _last_trend_alert_date = today
+            head = "📈 <b>健康趨勢提示</b>（唔係單次超標，而係呢排持續）\n\n"
+            send_message(OWNER_ID, head + "\n\n".join(notes))
+    except Exception as e:
+        print(f"[ERROR] trend alerts: {e}")
+
 # ── Weekly auto-backup ──────────────────────────────────────────────
 
 _last_backup_week = ""
@@ -1120,6 +1303,10 @@ def reminder_loop():
                 check_weekly_backup()
             except Exception as e:
                 print(f"[WARN] weekly backup: {e}")
+            try:
+                check_trend_alerts()
+            except Exception as e:
+                print(f"[WARN] trend alerts: {e}")
             last_check = now
         time.sleep(30)
 
