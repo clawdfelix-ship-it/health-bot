@@ -103,6 +103,36 @@ def answer_callback(callback_id, text=""):
     except Exception:
         pass
 
+def call_tg(method, payload):
+    """Generic Telegram Bot API call (for setMyCommands / setChatMenuButton)."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[WARN] telegram {method}: {e}")
+        return None
+
+def setup_bot_menu():
+    """Register the slash-command list and point the text-field Menu button at it.
+    Runs once at startup; safe to re-run (it just overwrites the bot's config)."""
+    commands = [
+        {"command": "menu",     "description": "🏠 主菜單"},
+        {"command": "record",   "description": "📊 記錄血糖/血壓/尿酸/體重"},
+        {"command": "today",    "description": "📖 今日記錄"},
+        {"command": "trend",    "description": "📈 趨勢報告 / 就醫 PDF"},
+        {"command": "meds",     "description": "💊 服藥打卡"},
+        {"command": "schedule", "description": "📋 服藥時間表"},
+        {"command": "export",   "description": "📤 匯出 CSV 備份"},
+        {"command": "help",     "description": "❓ 使用說明"},
+    ]
+    call_tg("setMyCommands", {"commands": commands})
+    # No chat_id => sets the DEFAULT menu button for every user. Type "commands"
+    # makes the blue Menu button next to the message box open the command list.
+    call_tg("setChatMenuButton", {"menu_button": {"type": "commands"}})
+
 def edit_message(chat_id, message_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
@@ -645,7 +675,60 @@ def handle_callback(callback, chat_id, message_id):
         edit_message(chat_id, message_id, get_meds_text(), meds_keyboard())
         return
 
+def handle_command(text, chat_id):
+    """Handle /slash commands (from the Menu button or command list).
+    Returns True if the message was a command and was handled."""
+    stripped = text.strip()
+    first = stripped.split()[0] if stripped else ""
+    if not first.startswith("/"):
+        return False
+    # Strip leading "/" and any "@botname" suffix (used in group chats).
+    cmd = first[1:].split("@", 1)[0].lower()
+
+    # A command cancels any half-finished numeric entry so a stale prompt
+    # can't swallow the next reading the user types.
+    pending.pop(chat_id, None)
+
+    if cmd in ("start", "menu"):
+        send_message(chat_id, "🏠 主菜單", main_menu())
+    elif cmd == "record":
+        send_message(chat_id, "📊 選擇記錄項目：", record_menu())
+    elif cmd == "today":
+        send_message(chat_id, get_today_summary(), back_btn())
+    elif cmd == "trend":
+        send_message(chat_id, "📈 請選擇報告時段：", {
+            "inline_keyboard": [
+                [{"text": "📅 最近 7 日", "callback_data": "trend_7"},
+                 {"text": "🗓️ 最近 30 日", "callback_data": "trend_30"}],
+                [{"text": "📄 就醫報告 PDF（90 日）", "callback_data": "clinic_90"}],
+                [{"text": "🔙 返回主菜單", "callback_data": "back"}],
+            ]})
+    elif cmd == "meds":
+        send_message(chat_id, get_meds_text(), meds_keyboard())
+    elif cmd == "schedule":
+        send_message(chat_id, get_schedule_text(), schedule_menu())
+    elif cmd == "export":
+        export_and_send(chat_id, None)
+    elif cmd == "help":
+        send_message(chat_id,
+            "❓ <b>健康記錄 bot</b>\n\n"
+            "直接撳左下角藍色 <b>Menu</b> 掣，或輸入：\n"
+            "/record — 記錄血糖/血壓/尿酸/體重\n"
+            "/today — 今日記錄摘要\n"
+            "/trend — 趨勢報告 / 就醫 PDF\n"
+            "/meds — 服藥打卡\n"
+            "/schedule — 服藥時間表\n"
+            "/export — 匯出 CSV 備份\n\n"
+            "📥 匯入：將 health_export.csv 直接 send 過嚟即可還原。\n"
+            "輸入數值時按提示格式（血壓如 128/79）。",
+            back_btn())
+    else:
+        send_message(chat_id, "🤷 唔識呢個指令。", main_menu())
+    return True
+
 def handle_text(text, chat_id):
+    if handle_command(text, chat_id):
+        return
     if chat_id in pending:
         p = pending.pop(chat_id)
         ptype = p["type"]
@@ -768,10 +851,14 @@ def handle_text(text, chat_id):
     # Default: show main menu
     send_message(chat_id, "🏠 主菜單", main_menu())
 
-def export_and_send(chat_id, message_id):
+def export_and_send(chat_id, message_id=None):
     data = load_data()
     if not data:
-        edit_message(chat_id, message_id, "📤 沒有數據可匯出", back_btn())
+        msg = "📤 沒有數據可匯出"
+        if message_id:
+            edit_message(chat_id, message_id, msg, back_btn())
+        else:
+            send_message(chat_id, msg, back_btn())
         return
 
     output = io.StringIO()
@@ -788,7 +875,10 @@ def export_and_send(chat_id, message_id):
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write(output.getvalue())
 
-    edit_message(chat_id, message_id, "📤 正在生成 CSV...", back_btn())
+    if message_id:
+        edit_message(chat_id, message_id, "📤 正在生成 CSV...", back_btn())
+    else:
+        send_message(chat_id, "📤 正在生成 CSV...", back_btn())
     send_document(chat_id, csv_path, "📊 健康數據匯出")
 
 # ── Medication check-in ─────────────────────────────────────────────
@@ -1313,6 +1403,8 @@ def reminder_loop():
 # ── Start ──────────────────────────────────────────────────────────
 
 if BOT_TOKEN:
+    # Register the slash-command list + Menu button before serving updates.
+    setup_bot_menu()
     t1 = threading.Thread(target=poll_updates, daemon=True)
     t1.start()
     t2 = threading.Thread(target=reminder_loop, daemon=True)
