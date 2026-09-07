@@ -17,6 +17,8 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 
+import db
+
 # Matplotlib is used for trend charts. Use the non-interactive Agg backend so it
 # works headless on Zeabur (no display server).
 import matplotlib
@@ -229,12 +231,25 @@ def restore_from_csv_bytes(raw_bytes, chat_id):
 
     with data_lock:
         save_data(rebuilt)
+    # Mirror the full restored set into Neon so phone-forwarded weekly CSVs
+    # populate long-term history in the dashboard database too.
+    try:
+        rows = []
+        for d, day in rebuilt.items():
+            for r in day.get("records", []):
+                rows.append((d, r.get("type"), r.get("time", ""), r.get("value", "")))
+        n_db = db.bulk_upsert_readings(rows)
+    except Exception as e:
+        n_db = 0
+        print(f"[db][WARN] CSV import mirror failed: {e}")
     days = len(rebuilt)
+    db_note = f"\n🗄️ 已同步 {n_db} 條到雲端數據庫" if n_db else ""
     bak_note = f"\n💾 匯入前已自動備份：{os.path.basename(bak_path)}" if bak_path else ""
     send_message(chat_id,
         f"✅ 匯入完成\n\n"
-        f"📊 還原 {count} 條記錄，覆蓋 {days} 日\n"
-        f"📁 儲存位置：{DATA_DIR}{bak_note}")
+        f"📊 還原 {count} 條記錄，覆蓋 {days} 日"
+        f"{db_note}"
+        f"\n📁 儲存位置：{DATA_DIR}{bak_note}")
 
 def handle_document(message, chat_id):
     doc = message.get("document") or {}
@@ -396,6 +411,8 @@ def record_entry(chat_id, entry_type, value):
         ]
         data[today]["records"].append(record)
         save_data(data)
+    # Mirror to Neon (best-effort; never blocks recording if DB is down).
+    db.upsert_reading(today, entry_type, current_time, value)
     return record
 
 # ── Safety alerts ───────────────────────────────────────────────────
@@ -923,6 +940,7 @@ def mark_med_taken(key):
         data = load_meds()
         data.setdefault(today, {})[key] = ts
         save_meds(data)
+    db.mark_med_taken(today, key)
 
 def clear_meds_today():
     today = hk_now().strftime("%Y-%m-%d")
@@ -930,6 +948,7 @@ def clear_meds_today():
         data = load_meds()
         data.pop(today, None)
         save_meds(data)
+    db.clear_meds(today)
 
 def get_meds_text():
     today = hk_now().strftime("%Y-%m-%d")
@@ -1405,6 +1424,10 @@ def reminder_loop():
 if BOT_TOKEN:
     # Register the slash-command list + Menu button before serving updates.
     setup_bot_menu()
+    # Initialise Neon mirror tables, then one-time backfill from the JSON file
+    # if the cloud DB is empty (safe no-ops when DATABASE_URL unset).
+    db.init_db()
+    db.backfill_from_file(load_data)
     t1 = threading.Thread(target=poll_updates, daemon=True)
     t1.start()
     t2 = threading.Thread(target=reminder_loop, daemon=True)
