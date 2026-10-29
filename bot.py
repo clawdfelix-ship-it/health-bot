@@ -1452,6 +1452,9 @@ def check_injection_reminders():
                 f"係時候打 <b>{med}</b> 啦！\n\n"
                 f"上次注射：{info['last_date']} {info['last_time']}\n"
                 f"今次時間：{info['next_date']} {info['next_time']}\n\n"
+                f"⚠️ <b>步驟</b>：\n"
+                f"1️⃣ 打針前<b>先放氣</b>（排出筆內空氣）\n"
+                f"2️⃣ 確認劑量視窗後先注射\n\n"
                 f"打完之後記得用 /injection 記錄，我會自動安排下一次提醒。")
             # Auto-schedule next one (7 days later)
             next_date = (now + timedelta(days=7)).strftime("%Y-%m-%d")
