@@ -121,14 +121,15 @@ def setup_bot_menu():
     """Register the slash-command list and point the text-field Menu button at it.
     Runs once at startup; safe to re-run (it just overwrites the bot's config)."""
     commands = [
-        {"command": "menu",     "description": "🏠 主菜單"},
-        {"command": "record",   "description": "📊 記錄血糖/血壓/尿酸/體重"},
-        {"command": "today",    "description": "📖 今日記錄"},
-        {"command": "trend",    "description": "📈 趨勢報告 / 就醫 PDF"},
-        {"command": "meds",     "description": "💊 服藥打卡"},
-        {"command": "schedule", "description": "📋 服藥時間表"},
-        {"command": "export",   "description": "📤 匯出 CSV 備份"},
-        {"command": "help",     "description": "❓ 使用說明"},
+        {"command": "menu",      "description": "🏠 主菜單"},
+        {"command": "record",    "description": "📊 記錄血糖/血壓/尿酸/體重"},
+        {"command": "today",     "description": "📖 今日記錄"},
+        {"command": "trend",     "description": "📈 趨勢報告 / 就醫 PDF"},
+        {"command": "meds",      "description": "💊 服藥打卡"},
+        {"command": "schedule",  "description": "📋 服藥時間表"},
+        {"command": "injection", "description": "💉 記錄 Mounjaro 注射"},
+        {"command": "export",    "description": "📤 匯出 CSV 備份"},
+        {"command": "help",      "description": "❓ 使用說明"},
     ]
     call_tg("setMyCommands", {"commands": commands})
     # No chat_id => sets the DEFAULT menu button for every user. Type "commands"
@@ -316,6 +317,7 @@ def main_menu():
             [{"text": "📖 今日記錄", "callback_data": "today"},
              {"text": "📈 趨勢報告", "callback_data": "trend"}],
             [{"text": "💊 服藥打卡", "callback_data": "meds_today"}],
+            [{"text": "💉 注射記錄", "callback_data": "injection_status"}],
             [{"text": "📤 匯出 CSV", "callback_data": "export_csv"},
              {"text": "📥 匯入還原", "callback_data": "import_help"}],
         ]
@@ -692,6 +694,30 @@ def handle_callback(callback, chat_id, message_id):
         edit_message(chat_id, message_id, get_meds_text(), meds_keyboard())
         return
 
+    # Injection status
+    if data == "injection_status":
+        edit_message(chat_id, message_id, get_next_injection_text(), {
+            "inline_keyboard": [
+                [{"text": "💉 記錄今日注射", "callback_data": "injection_record"}],
+                [{"text": "🔙 返回主菜單", "callback_data": "back"}],
+            ]
+        })
+        return
+
+    if data == "injection_record":
+        next_date, next_time = record_injection("Mounjaro", "11:00")
+        edit_message(chat_id, message_id,
+            f"💉 <b>Mounjaro 注射已記錄</b>\n\n"
+            f"上次注射：今日 11:00\n"
+            f"下次提醒：<b>{next_date} {next_time}</b>\n\n"
+            f"到時我會自動提醒你。",
+            {
+                "inline_keyboard": [
+                    [{"text": "🔙 返回主菜單", "callback_data": "back"}],
+                ]
+            })
+        return
+
 def handle_command(text, chat_id):
     """Handle /slash commands (from the Menu button or command list).
     Returns True if the message was a command and was handled."""
@@ -726,6 +752,14 @@ def handle_command(text, chat_id):
         send_message(chat_id, get_schedule_text(), schedule_menu())
     elif cmd == "export":
         export_and_send(chat_id, None)
+    elif cmd == "injection":
+        # Quick record Mounjaro injection
+        next_date, next_time = record_injection("Mounjaro", "11:00")
+        send_message(chat_id,
+            f"💉 <b>Mounjaro 注射已記錄</b>\n\n"
+            f"上次注射：今日 11:00\n"
+            f"下次提醒：<b>{next_date} {next_time}</b>\n\n"
+            f"到時我會自動提醒你。")
     elif cmd == "help":
         send_message(chat_id,
             "❓ <b>健康記錄 bot</b>\n\n"
@@ -735,7 +769,8 @@ def handle_command(text, chat_id):
             "/trend — 趨勢報告 / 就醫 PDF\n"
             "/meds — 服藥打卡\n"
             "/schedule — 服藥時間表\n"
-            "/export — 匯出 CSV 備份\n\n"
+            "/export — 匯出 CSV 備份\n"
+            "/injection — 記錄 Mounjaro 注射\n\n"
             "📥 匯入：將 health_export.csv 直接 send 過嚟即可還原。\n"
             "輸入數值時按提示格式（血壓如 128/79）。",
             back_btn())
@@ -910,6 +945,64 @@ MEDS = [
     ("metformin_2",   "19:00", "💊 Metformin 500mg（晚餐時）"),
     ("gliclazide_2",  "19:00", "💊 Gliclazide 80mg（晚餐時）"),
 ]
+
+# ── Injection reminders (weekly) ─────────────────────────────────────
+# Track weekly injections like Mounjaro. Stored in its own file so it
+# doesn't interfere with daily meds.
+INJECTIONS_FILE = "injections_log.json"
+
+def get_injections_path():
+    return os.path.join(DATA_DIR, INJECTIONS_FILE)
+
+def load_injections():
+    path = get_injections_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_injections(data):
+    path = get_injections_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def record_injection(med_name, injection_time):
+    """Record an injection and schedule next reminder in 7 days."""
+    today = hk_now().strftime("%Y-%m-%d")
+    ts = injection_time or hk_now().strftime("%H:%M")
+    next_date = (hk_now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    next_time = ts
+    
+    with data_lock:
+        data = load_injections()
+        data[med_name] = {
+            "last_date": today,
+            "last_time": ts,
+            "next_date": next_date,
+            "next_time": next_time,
+        }
+        save_injections(data)
+    return next_date, next_time
+
+def get_next_injection_text():
+    """Return text showing next injection reminder."""
+    data = load_injections()
+    if not data:
+        return "💉 暫無注射記錄"
+    lines = ["💉 <b>注射提醒</b>", ""]
+    for med, info in data.items():
+        lines.append(f"💊 {med}")
+        lines.append(f"   上次：{info['last_date']} {info['last_time']}")
+        lines.append(f"   下次：<b>{info['next_date']} {info['next_time']}</b>")
+        lines.append("")
+    return "\n".join(lines)
 
 def get_meds_path():
     return os.path.join(DATA_DIR, "meds_log.json")
@@ -1344,9 +1437,33 @@ def poll_updates():
 
 # ── Reminder scheduler ─────────────────────────────────────────────
 
+# Weekly injection reminders (Mounjaro etc.)
+def check_injection_reminders():
+    """Check if any weekly injection is due today."""
+    now = hk_now()
+    today = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M")
+    
+    data = load_injections()
+    for med, info in data.items():
+        if info["next_date"] == today and info["next_time"] == current_time:
+            send_message(OWNER_ID, 
+                f"💉 <b>注射提醒</b>\n\n"
+                f"係時候打 <b>{med}</b> 啦！\n\n"
+                f"上次注射：{info['last_date']} {info['last_time']}\n"
+                f"今次時間：{info['next_date']} {info['next_time']}\n\n"
+                f"打完之後記得用 /injection 記錄，我會自動安排下一次提醒。")
+            # Auto-schedule next one (7 days later)
+            next_date = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+            data[med]["last_date"] = today
+            data[med]["last_time"] = current_time
+            data[med]["next_date"] = next_date
+            data[med]["next_time"] = current_time
+            save_injections(data)
+
 REMINDERS = {
     "09:30": {
-        "msg": "⏰ 09:30 — 起床時間！\n\n💧 飲幾小口溫水\n→ 🍶 食四君子丸（空腹）\n⚠️ 和降血壓藥隔30分鐘",
+        "msg": "⏰ 09:30 — 起床時間！\n\n💧 飲幾小口溫水\n→ 🍶 食四君子丸（空腹）\n⚠️ 和降血壓藥隔30分鐘\n\n⚖️ <b>記得量體重</b>（去主菜單「📊 記錄」→「⚖️ 體重」）",
         "key": "sijunzi_am",
     },
     "10:00": {
@@ -1401,6 +1518,9 @@ def check_reminders():
         if cur_min >= remind_min and key not in last_remind:
             last_remind.add(key)
             send_message(OWNER_ID, info["msg"])
+    
+    # Check weekly injection reminders
+    check_injection_reminders()
 
 def reminder_loop():
     last_check = 0
